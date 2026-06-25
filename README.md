@@ -10,7 +10,7 @@ failover, and per-key credit accounting.
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-41%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen.svg)](#testing)
 [![Status](https://img.shields.io/badge/status-v0.1-yellow.svg)](#roadmap)
 
 </div>
@@ -90,7 +90,33 @@ curl -X POST "http://127.0.0.1:8080/?api-key=$GATEWAY_KEY" \
 ```
 
 > `config.toml` is gitignored — your real keys never get committed.
-> The config path defaults to `config.toml`; override with `NINEHELIUS_CONFIG`.
+
+### CLI flags
+
+The binary takes paths so it can run from anywhere (e.g. as a service):
+
+```bash
+ninehelius --config /etc/9helius/config.toml --state /var/lib/9helius/credits.json
+ninehelius --help        # full usage; --version prints the build version
+```
+
+- `-c, --config <PATH>` — config file. Precedence: `--config` > `NINEHELIUS_CONFIG` env > `./config.toml`.
+- `-s, --state <PATH>` — credit/stats snapshot file; overrides `persistence.path`.
+  Use **absolute paths** in service deployments so nothing depends on the working
+  directory. Parent directories are created automatically.
+
+### Deploying as a systemd service
+
+```ini
+# /etc/systemd/system/9helius.service
+[Service]
+ExecStart=/usr/local/bin/ninehelius --config /etc/9helius/config.toml --state /var/lib/9helius/credits.json
+Restart=always
+# secrets via env instead of a file also work:
+# Environment=NINEHELIUS_UPSTREAMS__0__API_KEY=...
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Using the gateway
 

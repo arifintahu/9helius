@@ -371,6 +371,61 @@ async fn e2e_history_visible_after_month_rollover() {
 }
 
 #[tokio::test]
+async fn e2e_cli_config_and_state_flags() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": 1})))
+        .mount(&upstream)
+        .await;
+
+    let dir = unique_dir("cli");
+    let cfg_path = dir.join("myconfig.toml");
+    // The config points persistence.path here; --state must override it.
+    let placeholder = dir.join("SHOULD_NOT_BE_USED.json");
+    // A nested path that doesn't exist yet — also verifies dir auto-creation.
+    let custom_state = dir.join("nested/custom-state.json");
+    let port = free_port();
+    std::fs::write(
+        &cfg_path,
+        config_toml(
+            port,
+            &placeholder.to_string_lossy(),
+            &upstream.uri(),
+            1,
+            &[("u0", "k0", 1_000_000)],
+        ),
+    )
+    .unwrap();
+
+    // Spawn purely via CLI flags — no NINEHELIUS_CONFIG env.
+    let child = Command::new(env!("CARGO_BIN_EXE_ninehelius"))
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--state")
+        .arg(&custom_state)
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn with CLI flags");
+    let _g = ChildGuard(child);
+
+    let base = format!("http://127.0.0.1:{port}");
+    wait_ready(&base).await;
+    post_rpc(&base, "gw", "getSlot").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await; // periodic snapshot
+
+    assert!(
+        custom_state.exists(),
+        "snapshot should be written to the --state path"
+    );
+    assert!(
+        !placeholder.exists(),
+        "config's persistence.path should have been overridden by --state"
+    );
+}
+
+#[tokio::test]
 async fn e2e_daily_history_visible_after_day_rollover() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

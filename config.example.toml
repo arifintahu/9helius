@@ -21,7 +21,9 @@ max_retries = 6
 max_body_bytes = 5242880
 
 [persistence]
-# Credit-usage snapshot file (gitignored).
+# Credit-usage snapshot file (gitignored). Relative paths resolve against the
+# working directory; use an absolute path (or the --state CLI flag) for service
+# deployments. Parent directories are created automatically.
 path = "state/credits.snapshot.json"
 # How often to flush the snapshot to disk.
 interval_secs = 10

@@ -1,8 +1,10 @@
 //! 9helius binary entry point — loads config, initializes telemetry, and serves
 //! the proxy. All application logic lives in the `ninehelius` library crate.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
+use clap::Parser;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -11,14 +13,42 @@ use ninehelius::state::{AppState, SharedState};
 use ninehelius::upstream::{current_yyyymm, current_yyyymmdd};
 use ninehelius::{metrics, persistence, ratelimit, router};
 
+/// Transparent Helius RPC load balancer.
+#[derive(Parser, Debug)]
+#[command(name = "ninehelius", version, about, long_about = None)]
+struct Cli {
+    /// Path to the config file.
+    /// Overrides the NINEHELIUS_CONFIG env var; defaults to ./config.toml.
+    #[arg(short, long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Path to the credit/stats snapshot file.
+    /// Overrides `persistence.path` from the config (use an absolute path for
+    /// service deployments so it doesn't depend on the working directory).
+    #[arg(short, long, value_name = "PATH")]
+    state: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    let cli = Cli::parse();
 
-    let config_path = std::env::var("NINEHELIUS_CONFIG").unwrap_or_else(|_| "config.toml".into());
-    let config = Config::load(&config_path)?;
+    // Config path precedence: --config flag > NINEHELIUS_CONFIG env > ./config.toml
+    let config_path = cli
+        .config
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| std::env::var("NINEHELIUS_CONFIG").ok())
+        .unwrap_or_else(|| "config.toml".into());
+
+    let mut config = Config::load(&config_path)?;
+    // --state overrides the snapshot path from the config file.
+    if let Some(state) = cli.state {
+        config.persistence.path = state;
+    }
     info!(
         path = %config_path,
+        state = %config.persistence.path.display(),
         upstreams = config.upstreams.len(),
         bind = %config.gateway.bind,
         "configuration loaded"

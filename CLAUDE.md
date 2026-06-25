@@ -16,7 +16,10 @@ rate limits, and persisting all stats across restarts.
 ## Commands
 
 ```bash
-cargo run --release            # run (reads ./config.toml; override via NINEHELIUS_CONFIG)
+cargo run --release            # run (reads ./config.toml)
+# binary flags (deployable from any CWD):
+#   --config <PATH>  config file  (precedence: --config > NINEHELIUS_CONFIG env > ./config.toml)
+#   --state  <PATH>  snapshot file (overrides persistence.path; use absolute for services)
 cargo build
 cargo test                     # unit + integration (wiremock) + e2e (spawns the binary)
 cargo test --test e2e          # one integration-test binary
