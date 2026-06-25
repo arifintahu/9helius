@@ -12,6 +12,7 @@ pub mod credits;
 pub mod error;
 pub mod metrics;
 pub mod proxy;
+pub mod ratelimit;
 pub mod state;
 pub mod upstream;
 

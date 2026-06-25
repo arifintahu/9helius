@@ -39,7 +39,7 @@ impl AppState {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()?;
         let upstream_base = Url::parse(&config.gateway.upstream_base)?;
-        let pool = Pool::from_config(&config.upstreams);
+        let pool = Pool::from_config(&config.upstreams, &config.rps);
         let costs = CostTable::from_config(&config.costs);
 
         Ok(Arc::new(AppState {

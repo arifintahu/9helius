@@ -47,7 +47,7 @@ pub async fn prometheus(State(state): State<SharedState>) -> impl IntoResponse {
 
 /// `GET /stats` — operator-friendly JSON snapshot.
 pub async fn stats(State(state): State<SharedState>) -> impl IntoResponse {
-    let upstreams = state.pool.stats();
+    let upstreams = state.pool.stats(crate::ratelimit::now_ms());
     let body = serde_json::json!({
         "uptime_secs": state.uptime_secs(),
         "gateway_bind": state.config.gateway.bind,

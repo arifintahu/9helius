@@ -28,6 +28,30 @@ async fn test_state(upstream_base: &str) -> ninehelius::state::SharedState {
     AppState::new(config, prom).expect("state")
 }
 
+/// Build an `AppState` with several upstream keys, all pointing at `base`.
+async fn test_state_keys(base: &str, keys: &[&str]) -> ninehelius::state::SharedState {
+    let mut blocks = String::new();
+    for (i, k) in keys.iter().enumerate() {
+        blocks.push_str(&format!(
+            "\n[[upstreams]]\nname = \"u{i}\"\napi_key = \"{k}\"\n"
+        ));
+    }
+    let toml = format!(
+        r#"
+        [gateway]
+        bind = "127.0.0.1:0"
+        api_key = "test-gw-key"
+        upstream_base = "{base}"
+        {blocks}
+        "#
+    );
+    let config = Config::from_toml_str(&toml).expect("valid config");
+    let prom = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .build_recorder()
+        .handle();
+    AppState::new(config, prom).expect("state")
+}
+
 /// Spawn the app on an ephemeral port and return its base URL.
 async fn spawn(state: ninehelius::state::SharedState) -> String {
     let app = ninehelius::router(state);
@@ -121,6 +145,86 @@ async fn tracks_credits_in_stats() {
 
     let used = stats["upstreams"][0]["credits_used"].as_u64().unwrap();
     assert_eq!(used, 10, "expected 10 credits charged, stats={stats}");
+}
+
+#[tokio::test]
+async fn retries_next_key_on_http_429() {
+    let upstream = MockServer::start().await;
+    // First key (u0 = key-1) is rate-limited; second key (u1 = key-2) succeeds.
+    Mock::given(query_param("api-key", "key-1"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&upstream)
+        .await;
+    Mock::given(query_param("api-key", "key-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result":"ok"})))
+        .mount(&upstream)
+        .await;
+
+    let state = test_state_keys(&upstream.uri(), &["key-1", "key-2"]).await;
+    let base = spawn(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/?api-key=test-gw-key"))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"getSlot"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["result"], "ok");
+}
+
+#[tokio::test]
+async fn retries_next_key_on_jsonrpc_32005() {
+    let upstream = MockServer::start().await;
+    // HTTP 200 but JSON-RPC "Too many requests" — must be treated as rate-limited.
+    Mock::given(query_param("api-key", "key-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Too many requests"}}),
+        ))
+        .mount(&upstream)
+        .await;
+    Mock::given(query_param("api-key", "key-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result":"ok"})))
+        .mount(&upstream)
+        .await;
+
+    let state = test_state_keys(&upstream.uri(), &["key-1", "key-2"]).await;
+    let base = spawn(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/?api-key=test-gw-key"))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"getSlot"}))
+        .send()
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["result"], "ok", "should fail over past the -32005 key");
+}
+
+#[tokio::test]
+async fn all_rate_limited_returns_429() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&upstream)
+        .await;
+
+    let state = test_state_keys(&upstream.uri(), &["key-1", "key-2"]).await;
+    let base = spawn(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/?api-key=test-gw-key"))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"getSlot"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 429);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], -32005);
 }
 
 #[tokio::test]

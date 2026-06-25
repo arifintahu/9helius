@@ -1,17 +1,21 @@
-//! Upstream key pool and round-robin selection.
+//! Upstream key pool and selection.
 //!
 //! Each [`Upstream`] holds the runtime state for one Helius api-key. All mutable
-//! state is atomic so the hot path is lock-free. M2 implements round-robin
-//! selection that skips disabled keys; quota, cooldown, and RPS gating are
-//! layered on in later milestones (the fields already exist here).
+//! state is atomic (plus lock-free governor limiters) so the hot path needs no
+//! locks. [`Pool::select`] performs round-robin selection that skips keys which
+//! are disabled, over monthly quota, on rate-limit cooldown, or out of RPS
+//! tokens for the request's method class.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::config::UpstreamConfig;
+use crate::config::{RpsConfig, UpstreamConfig};
+use crate::credits::MethodClass;
+use crate::ratelimit::{self, Limiter};
 
 /// A string that never reveals itself in `Debug`/`Display` output.
 #[derive(Clone)]
@@ -36,7 +40,6 @@ impl fmt::Debug for SecretString {
 }
 
 /// Runtime state for a single upstream Helius key.
-#[derive(Debug)]
 pub struct Upstream {
     pub name: String,
     pub api_key: SecretString,
@@ -56,10 +59,13 @@ pub struct Upstream {
     pub in_flight: AtomicU32,
 
     pub enabled: AtomicBool,
+
+    /// Proactive RPS token buckets, one per method class.
+    limiters: HashMap<MethodClass, Limiter>,
 }
 
 impl Upstream {
-    pub fn from_config(c: &UpstreamConfig) -> Self {
+    pub fn from_config(c: &UpstreamConfig, rps: &RpsConfig) -> Self {
         Upstream {
             name: c.name.clone(),
             api_key: c.api_key.clone().into(),
@@ -70,6 +76,7 @@ impl Upstream {
             backoff_step: AtomicU32::new(0),
             in_flight: AtomicU32::new(0),
             enabled: AtomicBool::new(c.enabled),
+            limiters: ratelimit::build_limiters(rps),
         }
     }
 
@@ -95,14 +102,47 @@ impl Upstream {
         self.enabled.load(Ordering::Acquire)
     }
 
+    /// Try to consume one RPS token for `class`. Unlimited classes always succeed.
+    pub fn try_acquire(&self, class: MethodClass) -> bool {
+        match self.limiters.get(&class) {
+            Some(l) => l.check().is_ok(),
+            None => true,
+        }
+    }
+
+    pub fn in_cooldown(&self, now_ms: u64) -> bool {
+        self.cooldown_until.load(Ordering::Acquire) > now_ms
+    }
+
+    pub fn cooldown_remaining_ms(&self, now_ms: u64) -> u64 {
+        self.cooldown_until
+            .load(Ordering::Acquire)
+            .saturating_sub(now_ms)
+    }
+
+    /// Put this key on cooldown after a rate-limit response, growing the backoff.
+    pub fn trip_cooldown(&self, now_ms: u64) {
+        let step = self.backoff_step.fetch_add(1, Ordering::AcqRel);
+        let dur = ratelimit::backoff_with_jitter(step, now_ms);
+        self.cooldown_until.store(now_ms + dur, Ordering::Release);
+    }
+
+    /// Reset the backoff after a successful response.
+    pub fn note_success(&self) {
+        if self.backoff_step.load(Ordering::Acquire) != 0 {
+            self.backoff_step.store(0, Ordering::Release);
+        }
+    }
+
     /// A point-in-time snapshot for the `/stats` endpoint.
-    pub fn stat(&self) -> UpstreamStat {
+    pub fn stat(&self, now_ms: u64) -> UpstreamStat {
         UpstreamStat {
             name: self.name.clone(),
             credits_used: self.credits_used(),
             credit_cap: self.credit_cap,
             remaining: self.remaining_credits(),
             in_flight: self.in_flight.load(Ordering::Acquire),
+            cooldown_ms_left: self.cooldown_remaining_ms(now_ms),
             enabled: self.is_enabled(),
         }
     }
@@ -116,6 +156,7 @@ pub struct UpstreamStat {
     pub credit_cap: u64,
     pub remaining: u64,
     pub in_flight: u32,
+    pub cooldown_ms_left: u64,
     pub enabled: bool,
 }
 
@@ -126,11 +167,11 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn from_config(cfgs: &[UpstreamConfig]) -> Self {
+    pub fn from_config(cfgs: &[UpstreamConfig], rps: &RpsConfig) -> Self {
         Pool {
             upstreams: cfgs
                 .iter()
-                .map(|c| Arc::new(Upstream::from_config(c)))
+                .map(|c| Arc::new(Upstream::from_config(c, rps)))
                 .collect(),
             cursor: AtomicUsize::new(0),
         }
@@ -144,44 +185,51 @@ impl Pool {
         self.upstreams.is_empty()
     }
 
-    /// Round-robin selection skipping disabled keys. Each call advances the rotor
-    /// so concurrent requests fan out across keys. Returns `None` if every key is
-    /// disabled.
-    pub fn select_round_robin(&self) -> Option<Arc<Upstream>> {
+    /// Select an upstream for a request of the given `class` and `est_cost`,
+    /// skipping keys already tried this request (`skip`). Round-robin order;
+    /// skips disabled / over-quota / cooling-down / RPS-starved keys. Consumes
+    /// one RPS token from the chosen key. Returns its index plus a handle.
+    pub fn select(
+        &self,
+        class: MethodClass,
+        est_cost: u64,
+        skip: &[usize],
+        now_ms: u64,
+    ) -> Option<(usize, Arc<Upstream>)> {
         let n = self.upstreams.len();
         if n == 0 {
             return None;
         }
         let base = self.cursor.fetch_add(1, Ordering::Relaxed);
         for off in 0..n {
-            let up = &self.upstreams[(base + off) % n];
-            if up.is_enabled() {
-                return Some(up.clone());
+            let idx = (base + off) % n;
+            if skip.contains(&idx) {
+                continue;
             }
+            let up = &self.upstreams[idx];
+            if !up.is_enabled() || !up.has_quota_for(est_cost) || up.in_cooldown(now_ms) {
+                continue;
+            }
+            if !up.try_acquire(class) {
+                continue;
+            }
+            return Some((idx, up.clone()));
         }
         None
     }
 
-    /// Round-robin selection skipping keys that are disabled or would exceed
-    /// their monthly credit cap for a request costing `est_cost`. Returns `None`
-    /// if no key qualifies.
-    pub fn select_for_cost(&self, est_cost: u64) -> Option<Arc<Upstream>> {
-        let n = self.upstreams.len();
-        if n == 0 {
-            return None;
-        }
-        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
-        for off in 0..n {
-            let up = &self.upstreams[(base + off) % n];
-            if up.is_enabled() && up.has_quota_for(est_cost) {
-                return Some(up.clone());
-            }
-        }
-        None
+    /// Seconds until the soonest key leaves cooldown (min 1), if any is cooling.
+    pub fn soonest_cooldown_secs(&self, now_ms: u64) -> Option<u64> {
+        self.upstreams
+            .iter()
+            .map(|u| u.cooldown_remaining_ms(now_ms))
+            .filter(|&ms| ms > 0)
+            .min()
+            .map(|ms| ms.div_ceil(1000).max(1))
     }
 
-    pub fn stats(&self) -> Vec<UpstreamStat> {
-        self.upstreams.iter().map(|u| u.stat()).collect()
+    pub fn stats(&self, now_ms: u64) -> Vec<UpstreamStat> {
+        self.upstreams.iter().map(|u| u.stat(now_ms)).collect()
     }
 }
 
@@ -202,13 +250,24 @@ mod tests {
         }
     }
 
+    fn pool(cfgs: &[UpstreamConfig]) -> Pool {
+        Pool::from_config(cfgs, &RpsConfig::default())
+    }
+
+    const NOW: u64 = 1_000_000_000_000;
+
     #[test]
-    fn round_robin_cycles_all_enabled() {
-        let pool = Pool::from_config(&[cfg("a", true), cfg("b", true), cfg("c", true)]);
+    fn select_cycles_all_enabled() {
+        let p = pool(&[cfg("a", true), cfg("b", true), cfg("c", true)]);
         let picks: Vec<String> = (0..3)
-            .map(|_| pool.select_round_robin().unwrap().name.clone())
+            .map(|_| {
+                p.select(MethodClass::StandardRpc, 1, &[], NOW)
+                    .unwrap()
+                    .1
+                    .name
+                    .clone()
+            })
             .collect();
-        // Three consecutive picks should cover all three distinct keys.
         let mut sorted = picks.clone();
         sorted.sort();
         sorted.dedup();
@@ -216,41 +275,87 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_skips_disabled() {
-        let pool = Pool::from_config(&[cfg("a", false), cfg("b", true), cfg("c", false)]);
+    fn select_skips_disabled() {
+        let p = pool(&[cfg("a", false), cfg("b", true), cfg("c", false)]);
         for _ in 0..5 {
-            assert_eq!(pool.select_round_robin().unwrap().name, "b");
+            assert_eq!(
+                p.select(MethodClass::StandardRpc, 1, &[], NOW).unwrap().1.name,
+                "b"
+            );
         }
     }
 
     #[test]
-    fn none_when_all_disabled() {
-        let pool = Pool::from_config(&[cfg("a", false), cfg("b", false)]);
-        assert!(pool.select_round_robin().is_none());
-    }
-
-    #[test]
-    fn select_for_cost_skips_over_quota() {
-        // "a" has only 5 credits of headroom; a cost-10 request must route to "b".
-        let pool = Pool::from_config(&[cfg_cap("a", true, 5), cfg_cap("b", true, 1_000_000)]);
+    fn select_skips_over_quota() {
+        let p = pool(&[cfg_cap("a", true, 5), cfg_cap("b", true, 1_000_000)]);
         for _ in 0..6 {
-            assert_eq!(pool.select_for_cost(10).unwrap().name, "b");
+            assert_eq!(
+                p.select(MethodClass::StandardRpc, 10, &[], NOW).unwrap().1.name,
+                "b"
+            );
         }
     }
 
     #[test]
-    fn select_for_cost_none_when_all_over_quota() {
-        let pool = Pool::from_config(&[cfg_cap("a", true, 5), cfg_cap("b", true, 5)]);
-        assert!(pool.select_for_cost(10).is_none());
+    fn select_none_when_all_over_quota() {
+        let p = pool(&[cfg_cap("a", true, 5), cfg_cap("b", true, 5)]);
+        assert!(p.select(MethodClass::StandardRpc, 10, &[], NOW).is_none());
+    }
+
+    #[test]
+    fn select_honours_skip_set() {
+        let p = pool(&[cfg("a", true), cfg("b", true)]);
+        // Whatever index 0 maps to, skipping it must yield the other key.
+        let (idx, up) = p.select(MethodClass::StandardRpc, 1, &[], NOW).unwrap();
+        let (_, other) = p.select(MethodClass::StandardRpc, 1, &[idx], NOW).unwrap();
+        assert_ne!(up.name, other.name);
+    }
+
+    #[test]
+    fn select_skips_cooldown() {
+        let p = pool(&[cfg("a", true), cfg("b", true)]);
+        p.upstreams[0].trip_cooldown(NOW);
+        p.upstreams[1].trip_cooldown(NOW);
+        // Both cooling down → nothing selectable.
+        assert!(p.select(MethodClass::StandardRpc, 1, &[], NOW).is_none());
+        // Far in the future, cooldowns have elapsed.
+        assert!(p
+            .select(MethodClass::StandardRpc, 1, &[], NOW + 60_000)
+            .is_some());
+    }
+
+    #[test]
+    fn send_transaction_limited_to_one_rps_then_skips() {
+        // Single key, sendTransaction bucket = 1 RPS. Second immediate call has
+        // no token, so selection returns None.
+        let p = pool(&[cfg("a", true)]);
+        assert!(p
+            .select(MethodClass::SendTransaction, 1, &[], NOW)
+            .is_some());
+        assert!(p
+            .select(MethodClass::SendTransaction, 1, &[], NOW)
+            .is_none());
     }
 
     #[test]
     fn add_credits_reduces_remaining() {
-        let up = Upstream::from_config(&cfg_cap("a", true, 100));
+        let up = Upstream::from_config(&cfg_cap("a", true, 100), &RpsConfig::default());
         assert_eq!(up.remaining_credits(), 100);
         up.add_credits(30);
         assert_eq!(up.remaining_credits(), 70);
         assert!(up.has_quota_for(70));
         assert!(!up.has_quota_for(71));
+    }
+
+    #[test]
+    fn cooldown_and_recovery() {
+        let up = Upstream::from_config(&cfg("a", true), &RpsConfig::default());
+        assert!(!up.in_cooldown(NOW));
+        up.trip_cooldown(NOW);
+        assert!(up.in_cooldown(NOW));
+        up.note_success();
+        // backoff reset, but the existing cooldown window still applies until it elapses
+        assert!(up.in_cooldown(NOW));
+        assert!(!up.in_cooldown(NOW + 60_000));
     }
 }
