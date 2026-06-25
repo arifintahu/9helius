@@ -1,133 +1,223 @@
+<div align="center">
+
 # 9helius
 
-A transparent **Helius RPC load balancer** written in Rust. It combines several
-Helius free-tier api-keys behind a **single gateway URL and api-key**, forwarding
-every request to `https://mainnet.helius-rpc.com` in round-robin while:
+### One Helius RPC endpoint. All your free-tier keys. Zero rate limits.
 
-- **skipping keys** that are over their monthly credit cap or currently rate-limited,
-- **estimating credit cost** per request (per the [Helius credit table](https://www.helius.dev/docs/billing/credits)) and tracking it per key,
-- **respecting rate limits** ([Helius rate limits](https://www.helius.dev/docs/billing/rate-limits)) proactively (per-key token buckets) and reactively (on HTTP 429 / JSON-RPC `-32005` it cools the key down and retries the next one),
-- **exposing metrics** for routing, credits, and rate-limit activity.
+A transparent **Helius RPC load balancer** in Rust that pools multiple free-tier
+api-keys behind a single endpoint — round-robin routing, automatic rate-limit
+failover, and per-key credit accounting.
 
-Each free-tier key gives 1,000,000 credits/month and ~10 RPS; pooling *N* keys
-multiplies the effective free quota and throughput. It is a drop-in replacement —
-point any Helius client at the gateway and it just works.
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-36%20passing-brightgreen.svg)](#testing)
+[![Status](https://img.shields.io/badge/status-v0.1-yellow.svg)](#roadmap)
 
-## How clients use it
+</div>
 
-Call the gateway exactly like Helius, using your **gateway** api-key:
+---
 
-```bash
-curl -X POST "http://<host>:8080/?api-key=<GATEWAY_KEY>" \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+`9helius` makes _N_ Helius free-tier keys look like one big paid plan. Each free
+key gives **1,000,000 credits/month** and **~10 RPS**; point your client at the
+gateway and it transparently spreads traffic across all of them — skipping keys
+that are exhausted or rate-limited, and tracking exactly how many credits each
+one has burned.
+
+```
+                        ┌─────────────────────────────────────────┐
+                        │                9helius                   │
+   ┌────────┐  api-key  │                                          │   ┌──────────────┐
+   │ client │──────────▶│  auth ▶ cost-estimate ▶ select key ▶ ━━━━━━━▶│  Helius key 1 │
+   └────────┘  (one     │           │                  ▲         │   ├──────────────┤
+                gateway │           │   round-robin,   │ on 429  │   │  Helius key 2 │
+                key)    │           │   skip over-quota│ cooldown│   ├──────────────┤
+                        │           │   / cooling /    │ + retry │   │      ...       │
+                        │           ▼   RPS-starved    │  next   │   ├──────────────┤
+                        │      credit metering ────────┘         │   │  Helius key N │
+                        └─────────────────────────────────────────┘   └──────────────┘
 ```
 
-The gateway validates `<GATEWAY_KEY>`, swaps in one of the real upstream keys, and
-relays the upstream status/headers/body unchanged. The gateway key may also be
-sent as `x-api-key: <KEY>` or `Authorization: Bearer <KEY>`.
+## Table of contents
+
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Using the gateway](#using-the-gateway)
+- [Endpoints](#endpoints)
+- [Configuration](#configuration)
+- [How it works](#how-it-works)
+- [Metrics](#metrics)
+- [Testing](#testing)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+## Features
+
+- 🔀 **Drop-in replacement** — speaks the Helius wire protocol exactly. Only the
+  `api-key` is rewritten; method, path, query, body, and response pass through
+  byte-for-byte.
+- ⚖️ **Round-robin pooling** — lock-free atomic selection spreads load evenly and
+  multiplies your free quota and RPS by the number of keys.
+- 💳 **Credit accounting** — estimates each request's cost from its JSON-RPC
+  method (single **and** batch) using the real [Helius credit table](https://www.helius.dev/docs/billing/credits) and tracks per-key monthly usage.
+- 🛡️ **Rate-limit handling** — proactive per-key/per-class token buckets, plus
+  reactive failover: on HTTP `429` or JSON-RPC `-32005`, the key is put on an
+  exponential-backoff cooldown and the request retries the next available key.
+- ♻️ **Survives restarts** — per-key usage is snapshotted atomically and restored
+  on boot; counters reset automatically at each UTC month boundary.
+- 📊 **Observable** — Prometheus `/metrics`, a JSON `/stats` view, and a
+  capacity-aware `/health` probe.
+- 🔒 **Secret-safe** — real keys live only in a gitignored config and are redacted
+  in logs; clients only ever see the gateway key.
 
 ## Quick start
 
-1. **Configure.** Copy the example and fill in your keys:
+```bash
+# 1. Configure
+cp config.example.toml config.toml
+#    edit config.toml: set gateway.api_key and add one [[upstreams]] per Helius key
 
-   ```bash
-   cp config.example.toml config.toml
-   ```
+# 2. Run
+cargo run --release
 
-   Edit `config.toml`: set `gateway.api_key` to a secret of your choosing
-   (clients present this), and add one `[[upstreams]]` block per Helius key.
-   `config.toml` is gitignored — real keys never get committed.
+# 3. Use it
+curl -X POST "http://127.0.0.1:8080/?api-key=$GATEWAY_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+# → {"jsonrpc":"2.0","result":"ok","id":1}
+```
 
-2. **Run.**
+> `config.toml` is gitignored — your real keys never get committed.
+> The config path defaults to `config.toml`; override with `NINEHELIUS_CONFIG`.
 
-   ```bash
-   cargo run --release
-   ```
+## Using the gateway
 
-   The config path defaults to `config.toml`; override with `NINEHELIUS_CONFIG`.
+Call it exactly like Helius, presenting your **gateway** key. Three auth styles
+are accepted:
 
-3. **Verify.**
+```bash
+# query param (most Helius-compatible)
+curl "http://host:8080/?api-key=$GATEWAY_KEY"   -d '{...}'
+# header
+curl -H "x-api-key: $GATEWAY_KEY"               ...
+curl -H "Authorization: Bearer $GATEWAY_KEY"    ...
+```
 
-   ```bash
-   curl http://127.0.0.1:8080/health
-   curl http://127.0.0.1:8080/stats
-   curl http://127.0.0.1:8080/metrics
-   ```
+Any Helius SDK works — set the RPC URL to your gateway and use the gateway key:
+
+```ts
+import { Connection } from "@solana/web3.js";
+const rpc = new Connection("http://host:8080/?api-key=YOUR_GATEWAY_KEY");
+```
 
 ## Endpoints
 
-| Path        | Method | Purpose                                                        |
-|-------------|--------|----------------------------------------------------------------|
-| `/health`   | GET    | `200` if any key has quota left, `503` if all are exhausted    |
-| `/metrics`  | GET    | Prometheus exposition                                          |
-| `/stats`    | GET    | JSON: per-key credits used/remaining, in-flight, cooldown      |
-| *everything else* | any | Proxied transparently to the upstream Helius host        |
+| Path        | Method | Description                                                  |
+|-------------|:------:|--------------------------------------------------------------|
+| `/health`   | GET    | `200` if any key has quota left, `503` if all are exhausted  |
+| `/metrics`  | GET    | Prometheus exposition                                        |
+| `/stats`    | GET    | JSON: per-key credits, remaining, in-flight, cooldown        |
+| *anything else* | any | Proxied transparently to the upstream Helius host          |
 
-`/health`, `/metrics`, and `/stats` are the only reserved paths; all other
-requests are forwarded.
+`/health`, `/metrics`, and `/stats` are the only reserved paths; everything else
+is forwarded.
 
 ## Configuration
 
-See [`config.example.toml`](config.example.toml) for the full annotated schema.
-Highlights:
+Full annotated schema in [`config.example.toml`](config.example.toml).
 
-- `gateway.bind` — listen address (default `0.0.0.0:8080`).
-- `gateway.api_key` — the single key clients must present.
-- `gateway.max_retries` — max distinct keys to try per request (default 6).
-- `[costs.overrides]` — per-method credit costs (defaults are built in).
-- `[rps]` — per-class requests-per-second limits (free-tier defaults).
-- `[[upstreams]]` — one block per Helius key (`name`, `api_key`, `credit_cap`, `enabled`).
-- `[persistence]` — credit-usage snapshot path / interval / corruption policy.
+```toml
+[gateway]
+bind = "0.0.0.0:8080"
+api_key = "your-secret-gateway-key"   # clients present this
+upstream_base = "https://mainnet.helius-rpc.com"
+max_retries = 6                        # distinct keys to try per request
 
-Any field can be overridden by an environment variable prefixed `NINEHELIUS_`
-with `__` as the nesting separator, e.g.
-`NINEHELIUS_GATEWAY__API_KEY=…` or `NINEHELIUS_UPSTREAMS__0__API_KEY=…`.
+[persistence]
+path = "state/credits.snapshot.json"
+interval_secs = 10
+on_snapshot_error = "zero"             # "zero" | "cap"
+
+[costs.overrides]                      # defaults are built in; override as needed
+getProgramAccounts = 10
+getValidityProofs = 100
+
+[rps]                                  # free-tier per-key limits
+standard_rpc = 10
+send_transaction = 1
+get_program_accounts = 5
+das = 2
+zk = 2
+
+[[upstreams]]
+name = "helius-1"
+api_key = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+credit_cap = 1000000
+enabled = true
+# ... one block per key
+```
+
+**Environment overrides:** any field can be set via an env var prefixed
+`NINEHELIUS_` with `__` for nesting — handy for secrets in containers:
+
+```bash
+NINEHELIUS_GATEWAY__API_KEY=…
+NINEHELIUS_UPSTREAMS__0__API_KEY=…
+```
 
 ## How it works
 
-- **Credit costs** are estimated from the JSON-RPC `method` (single and batch
-  requests supported). Standard calls = 1 credit, `getProgramAccounts`/DAS/ZK =
-  10, `getValidityProofs` = 100. Credits are charged after a serviced response;
-  rate-limited and transient attempts are not charged.
-- **Monthly reset.** Per-key usage resets at each UTC month boundary and is
-  snapshotted to `state/credits.snapshot.json` (atomic temp-file + rename) so it
-  survives restarts. On boot, usage is restored only if the snapshot is from the
-  current month.
-- **Rate limiting.** Each key holds a token bucket per method class sized from the
-  configured RPS. If a key's bucket is empty the selector moves to another key.
-  On a `429`/`-32005`, the key is put on an exponential-backoff cooldown
-  (1s → 30s, ±25% jitter) and the request retries the next available key. When
-  every key is unavailable, the gateway returns `429` with a `Retry-After` header.
+| Concern        | Behaviour                                                                                                   |
+|----------------|------------------------------------------------------------------------------------------------------------|
+| **Cost**       | Estimated from the JSON-RPC method. Standard = 1, `getProgramAccounts`/DAS/ZK = 10, `getValidityProofs` = 100. Batches sum their calls. Charged only after a serviced (non-rate-limited) response. |
+| **Selection**  | Round-robin, skipping keys that are disabled, over their monthly cap, on cooldown, or out of RPS tokens for the request's class. |
+| **Rate limits**| Proactive token buckets per key per class. On `429`/`-32005`, the key cools down (1s→30s exponential, ±25% jitter) and the request retries the next key. All keys unavailable → `429` + `Retry-After`. |
+| **Persistence**| Usage snapshotted to disk (atomic temp-file + rename), restored on boot only if the snapshot is from the current UTC month. |
+| **Reset**      | Per-key counters reset automatically at each UTC month boundary.                                            |
 
 ## Metrics
 
-Prometheus metrics (all prefixed `ninehelius_`): `requests_total{upstream,outcome}`,
-`credits_consumed_total{upstream}`, `credits_remaining{upstream}`,
-`rate_limit_hits_total{upstream}`, `upstream_errors_total{upstream,kind}`,
-`inflight{upstream}`, `rpc_method_total{method}`, `all_exhausted_total`,
-`request_duration_seconds`.
+All Prometheus metrics are prefixed `ninehelius_`:
 
-## Development
+| Metric | Type | Labels |
+|--------|------|--------|
+| `requests_total` | counter | `upstream`, `outcome` |
+| `credits_consumed_total` | counter | `upstream` |
+| `credits_remaining` | gauge | `upstream` |
+| `rate_limit_hits_total` | counter | `upstream` |
+| `upstream_errors_total` | counter | `upstream`, `kind` |
+| `inflight` | gauge | `upstream` |
+| `rpc_method_total` | counter | `method` |
+| `all_exhausted_total` | counter | — |
+| `request_duration_seconds` | histogram | — |
+
+## Testing
 
 ```bash
-cargo test            # unit + wiremock integration tests
+cargo test                  # unit + integration (wiremock) + e2e (spawns the binary)
 cargo clippy --all-targets
-cargo run             # uses config.toml
 ```
 
-Project layout (`src/`): `proxy` (transparent handler + retry loop), `upstream`
-(per-key state + pool selection), `credits` (method classification + cost),
-`ratelimit` (token buckets + backoff), `persistence` (snapshot), `config`,
-`state`, `metrics`, `error`.
+- **Unit tests** cover method classification, cost/quota math, selection, backoff, and snapshot restore.
+- **Integration tests** (`tests/proxy.rs`) build the router in-process and verify forwarding, auth, and rate-limit failover against a mock Helius.
+- **End-to-end tests** (`tests/e2e.rs`) spawn the real compiled binary against a mock upstream and verify round-robin, 429 failover, credit tracking, capacity-aware health, and persistence across a restart.
 
-## Scope
+**Project layout** (`src/`): `proxy` (transparent handler + retry loop) ·
+`upstream` (per-key state + pool selection) · `credits` (classification + cost) ·
+`ratelimit` (token buckets + backoff) · `persistence` (snapshot) · `config` ·
+`state` · `metrics` · `error`.
 
-v1 covers HTTP JSON-RPC / REST against `mainnet.helius-rpc.com`. WebSocket
-subscription proxying (sticky per-key connections) and the separate
-Enhanced/Wallet REST hosts are planned for a later phase.
+## Roadmap
 
-## Security
+- [x] Transparent HTTP JSON-RPC proxy with gateway auth
+- [x] Round-robin pooling with quota + rate-limit awareness
+- [x] Credit accounting, persistence, monthly reset
+- [x] Prometheus metrics + stats/health endpoints
+- [ ] WebSocket subscription proxying (sticky per-key sessions)
+- [ ] Enhanced Transactions (`api-mainnet/v0`) and Wallet (`api.helius.xyz/v1`) host routing
+- [ ] Weighted / least-credits selection strategies
 
-- Real api-keys live only in the gitignored `config.toml` and are redacted in logs.
-- Clients must present the gateway api-key; upstream keys are never exposed to clients.
+## License
+
+[MIT](LICENSE) © 2026 Miftahul Arifin
+
+> Not affiliated with or endorsed by Helius. "Helius" is a trademark of its respective owner.
