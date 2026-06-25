@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::credits;
 use crate::error::ProxyError;
 use crate::metrics::names;
 use crate::state::SharedState;
@@ -63,17 +64,24 @@ async fn proxy(
         return Err(ProxyError::PayloadTooLarge);
     }
 
-    // 3. Pick an upstream (M2: round-robin over enabled keys).
+    // 3. Estimate credit cost from the JSON-RPC method(s).
+    let parsed = credits::parse_body(uri.path(), &body);
+    let est = credits::request_cost(&parsed, &state.costs);
+
+    // 4. Pick an upstream with enough remaining monthly quota (round-robin).
     let upstream = state
         .pool
-        .select_round_robin()
+        .select_for_cost(est)
         .ok_or(ProxyError::AllUpstreamsExhausted {
             retry_after_secs: None,
         })?;
 
-    // 4. Forward, tracking in-flight load and request outcome.
+    // 5. Forward, tracking in-flight load and request outcome.
     let url = build_upstream_url(&state.upstream_base, &uri, upstream.api_key.expose())?;
-    debug!(upstream = %upstream.name, method = %method, path = uri.path(), "forwarding");
+    debug!(
+        upstream = %upstream.name, method = %method, path = uri.path(),
+        est_credits = est, "forwarding"
+    );
 
     let mut req = state.http.request(method, url);
     for (name, value) in &headers {
@@ -93,6 +101,8 @@ async fn proxy(
 
     match result {
         Ok(resp) => {
+            // The upstream serviced the request — commit the estimated credits.
+            commit_credits(&upstream, est, &parsed);
             metrics::counter!(names::REQUESTS_TOTAL,
                 "upstream" => upstream.name.clone(), "outcome" => "ok")
             .increment(1);
@@ -108,6 +118,18 @@ async fn proxy(
             .increment(1);
             Err(ProxyError::BadGateway(e.to_string()))
         }
+    }
+}
+
+/// Charge credits to the chosen key and update the related metrics.
+fn commit_credits(upstream: &crate::upstream::Upstream, est: u64, parsed: &credits::Parsed) {
+    let used = upstream.add_credits(est);
+    metrics::counter!(names::CREDITS_CONSUMED_TOTAL, "upstream" => upstream.name.clone())
+        .increment(est);
+    metrics::gauge!(names::CREDITS_REMAINING, "upstream" => upstream.name.clone())
+        .set(upstream.credit_cap.saturating_sub(used) as f64);
+    for method in credits::methods(parsed) {
+        metrics::counter!(names::RPC_METHOD_TOTAL, "method" => method.to_string()).increment(1);
     }
 }
 

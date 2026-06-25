@@ -73,13 +73,22 @@ pub enum SnapshotErrorPolicy {
 
 /// Per-method credit cost configuration. Defaults are applied in code
 /// ([`crate::credits`]); this only overrides or adds entries.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CostsConfig {
     #[serde(default)]
     pub overrides: HashMap<String, u32>,
     /// Cost charged for non-JSON-RPC REST paths when no path rule matches.
     #[serde(default = "default_rest_cost")]
     pub default_rest_cost: u32,
+}
+
+impl Default for CostsConfig {
+    fn default() -> Self {
+        Self {
+            overrides: HashMap::new(),
+            default_rest_cost: default_rest_cost(),
+        }
+    }
 }
 
 /// Per-class requests-per-second limits (Helius free tier, per key).

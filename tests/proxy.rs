@@ -91,6 +91,39 @@ async fn rejects_missing_gateway_key() {
 }
 
 #[tokio::test]
+async fn tracks_credits_in_stats() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result":1})))
+        .mount(&upstream)
+        .await;
+
+    let state = test_state(&upstream.uri()).await;
+    let base = spawn(state).await;
+    let client = reqwest::Client::new();
+
+    // getProgramAccounts costs 10 credits.
+    client
+        .post(format!("{base}/?api-key=test-gw-key"))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"getProgramAccounts"}))
+        .send()
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value = client
+        .get(format!("{base}/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let used = stats["upstreams"][0]["credits_used"].as_u64().unwrap();
+    assert_eq!(used, 10, "expected 10 credits charged, stats={stats}");
+}
+
+#[tokio::test]
 async fn accepts_gateway_key_via_header() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

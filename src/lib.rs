@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 pub mod config;
+pub mod credits;
 pub mod error;
 pub mod metrics;
 pub mod proxy;

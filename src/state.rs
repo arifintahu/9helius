@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 use url::Url;
 
 use crate::config::Config;
+use crate::credits::CostTable;
 use crate::upstream::Pool;
 
 /// Process-wide shared state.
@@ -25,6 +26,8 @@ pub struct AppState {
     pub upstream_base: Url,
     /// The pool of upstream keys with round-robin selection.
     pub pool: Pool,
+    /// Resolved per-method credit cost table.
+    pub costs: CostTable,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -37,6 +40,7 @@ impl AppState {
             .build()?;
         let upstream_base = Url::parse(&config.gateway.upstream_base)?;
         let pool = Pool::from_config(&config.upstreams);
+        let costs = CostTable::from_config(&config.costs);
 
         Ok(Arc::new(AppState {
             config,
@@ -45,6 +49,7 @@ impl AppState {
             http,
             upstream_base,
             pool,
+            costs,
         }))
     }
 

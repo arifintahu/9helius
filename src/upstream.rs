@@ -81,6 +81,16 @@ impl Upstream {
         self.credit_cap.saturating_sub(self.credits_used())
     }
 
+    /// True if charging `cost` more credits would stay within the cap.
+    pub fn has_quota_for(&self, cost: u64) -> bool {
+        self.credits_used().saturating_add(cost) <= self.credit_cap
+    }
+
+    /// Commit `cost` credits against this key, returning the new total.
+    pub fn add_credits(&self, cost: u64) -> u64 {
+        self.credits_used.fetch_add(cost, Ordering::AcqRel) + cost
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
     }
@@ -152,6 +162,24 @@ impl Pool {
         None
     }
 
+    /// Round-robin selection skipping keys that are disabled or would exceed
+    /// their monthly credit cap for a request costing `est_cost`. Returns `None`
+    /// if no key qualifies.
+    pub fn select_for_cost(&self, est_cost: u64) -> Option<Arc<Upstream>> {
+        let n = self.upstreams.len();
+        if n == 0 {
+            return None;
+        }
+        let base = self.cursor.fetch_add(1, Ordering::Relaxed);
+        for off in 0..n {
+            let up = &self.upstreams[(base + off) % n];
+            if up.is_enabled() && up.has_quota_for(est_cost) {
+                return Some(up.clone());
+            }
+        }
+        None
+    }
+
     pub fn stats(&self) -> Vec<UpstreamStat> {
         self.upstreams.iter().map(|u| u.stat()).collect()
     }
@@ -162,10 +190,14 @@ mod tests {
     use super::*;
 
     fn cfg(name: &str, enabled: bool) -> UpstreamConfig {
+        cfg_cap(name, enabled, 1_000_000)
+    }
+
+    fn cfg_cap(name: &str, enabled: bool, credit_cap: u64) -> UpstreamConfig {
         UpstreamConfig {
             name: name.into(),
             api_key: format!("key-{name}"),
-            credit_cap: 1_000_000,
+            credit_cap,
             enabled,
         }
     }
@@ -195,5 +227,30 @@ mod tests {
     fn none_when_all_disabled() {
         let pool = Pool::from_config(&[cfg("a", false), cfg("b", false)]);
         assert!(pool.select_round_robin().is_none());
+    }
+
+    #[test]
+    fn select_for_cost_skips_over_quota() {
+        // "a" has only 5 credits of headroom; a cost-10 request must route to "b".
+        let pool = Pool::from_config(&[cfg_cap("a", true, 5), cfg_cap("b", true, 1_000_000)]);
+        for _ in 0..6 {
+            assert_eq!(pool.select_for_cost(10).unwrap().name, "b");
+        }
+    }
+
+    #[test]
+    fn select_for_cost_none_when_all_over_quota() {
+        let pool = Pool::from_config(&[cfg_cap("a", true, 5), cfg_cap("b", true, 5)]);
+        assert!(pool.select_for_cost(10).is_none());
+    }
+
+    #[test]
+    fn add_credits_reduces_remaining() {
+        let up = Upstream::from_config(&cfg_cap("a", true, 100));
+        assert_eq!(up.remaining_credits(), 100);
+        up.add_credits(30);
+        assert_eq!(up.remaining_credits(), 70);
+        assert!(up.has_quota_for(70));
+        assert!(!up.has_quota_for(71));
     }
 }
