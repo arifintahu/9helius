@@ -1,0 +1,50 @@
+name: release
+
+# Cut a release by pushing a semver tag:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish (x86_64 linux)
+    # ubuntu-22.04 (glibc 2.35) for broad compatibility with older servers.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          NAME="9helius-x86_64-unknown-linux-gnu"
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/9helius dist/
+          cp README.md LICENSE config.example.toml dist/
+          tar -C dist -czf "${NAME}.tar.gz" 9helius README.md LICENSE config.example.toml
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            9helius-x86_64-unknown-linux-gnu.tar.gz
+            9helius-x86_64-unknown-linux-gnu.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

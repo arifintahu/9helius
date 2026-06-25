@@ -8,6 +8,7 @@ A transparent **Helius RPC load balancer** in Rust that pools multiple free-tier
 api-keys behind a single endpoint — round-robin routing, automatic rate-limit
 failover, and per-key credit accounting.
 
+[![Release](https://img.shields.io/github/v/release/arifintahu/9helius?sort=semver)](https://github.com/arifintahu/9helius/releases/latest)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen.svg)](#testing)
@@ -71,6 +72,21 @@ one has burned.
   capacity-aware `/health` probe.
 - 🔒 **Secret-safe** — real keys live only in a gitignored config and are redacted
   in logs; clients only ever see the gateway key.
+
+## Install
+
+**Prebuilt binary** (x86_64 Linux, glibc 2.35+):
+
+```bash
+curl -sSL https://github.com/arifintahu/9helius/releases/latest/download/9helius-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo install -m755 9helius /usr/local/bin/9helius
+9helius --version
+```
+
+Each release ships a `.tar.gz` (binary + `README` + `LICENSE` + `config.example.toml`)
+and a `.sha256` checksum on the [releases page](https://github.com/arifintahu/9helius/releases).
+
+**From source:** `cargo build --release` → `target/release/9helius`.
 
 ## Quick start
 
@@ -236,6 +252,17 @@ cargo clippy --all-targets
 `upstream` (per-key state + pool selection) · `credits` (classification + cost) ·
 `ratelimit` (token buckets + backoff) · `persistence` (snapshot) · `config` ·
 `state` · `metrics` · `error`.
+
+## Releasing
+
+Pushing a semver tag triggers the [release workflow](.github/workflows/release.yml),
+which tests, builds the x86_64 Linux binary, and publishes a GitHub release with
+the tarball + checksum:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
 
 ## Roadmap
 
