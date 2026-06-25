@@ -25,17 +25,17 @@ that are exhausted or rate-limited, and tracking exactly how many credits each
 one has burned.
 
 ```
-                        ┌─────────────────────────────────────────┐
+                        ┌──────────────────────────────────────────┐
                         │                9helius                   │
-   ┌────────┐  api-key  │                                          │   ┌──────────────┐
+   ┌────────┐  api-key  │                                          │   ┌───────────────┐
    │ client │──────────▶│  auth ▶ cost-estimate ▶ select key ▶ ━━━━━━━▶│  Helius key 1 │
-   └────────┘  (one     │           │                  ▲         │   ├──────────────┤
-                gateway │           │   round-robin,   │ on 429  │   │  Helius key 2 │
-                key)    │           │   skip over-quota│ cooldown│   ├──────────────┤
-                        │           │   / cooling /    │ + retry │   │      ...       │
-                        │           ▼   RPS-starved    │  next   │   ├──────────────┤
-                        │      credit metering ────────┘         │   │  Helius key N │
-                        └─────────────────────────────────────────┘   └──────────────┘
+   └────────┘  (one     │           │                  ▲           │   ├───────────────┤
+                gateway │           │   round-robin,   │ on 429    │   │  Helius key 2 │
+                key)    │           │   skip over-quota│ cooldown  │   ├───────────────┤
+                        │           │   / cooling /    │ + retry   │   │      ...      │
+                        │           ▼   RPS-starved    │  next     │   ├───────────────┤
+                        │      credit metering ────────┘           │   │  Helius key N │
+                        └──────────────────────────────────────────┘   └───────────────┘
 ```
 
 ## Table of contents
