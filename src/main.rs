@@ -1,24 +1,12 @@
-//! 9helius — a transparent Helius RPC load balancer.
-//!
-//! Combines several Helius free-tier api-keys behind one gateway URL, forwarding
-//! requests in round-robin while tracking credit usage and respecting rate limits.
+//! 9helius binary entry point — loads config, initializes telemetry, and serves
+//! the proxy. All application logic lives in the `ninehelius` library crate.
 
-// Some items are introduced a milestone before their first use; this is removed
-// during the final hardening pass.
-#![allow(dead_code)]
-
-mod config;
-mod error;
-mod metrics;
-mod state;
-
-use axum::routing::get;
-use axum::Router;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::config::Config;
-use crate::state::{AppState, SharedState};
+use ninehelius::config::Config;
+use ninehelius::state::AppState;
+use ninehelius::{metrics, router};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
 
     let prom = metrics::init_recorder()?;
     let bind = config.gateway.bind;
-    let state = AppState::new(config, prom);
+    let state = AppState::new(config, prom)?;
 
     let app = router(state.clone());
 
@@ -47,14 +35,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("shutdown complete");
     Ok(())
-}
-
-fn router(state: SharedState) -> Router {
-    Router::new()
-        .route("/health", get(metrics::health))
-        .route("/metrics", get(metrics::prometheus))
-        .route("/stats", get(metrics::stats))
-        .with_state(state)
 }
 
 fn init_tracing() {

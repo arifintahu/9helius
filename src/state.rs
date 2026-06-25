@@ -5,9 +5,11 @@
 //! stays lock-free.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusHandle;
 use time::OffsetDateTime;
+use url::Url;
 
 use crate::config::Config;
 
@@ -16,17 +18,29 @@ pub struct AppState {
     pub config: Config,
     pub prom: PrometheusHandle,
     pub started_at: OffsetDateTime,
+    /// Shared, connection-pooling client used for all upstream calls.
+    pub http: reqwest::Client,
+    /// Pre-parsed upstream base URL (only the api-key query param is rewritten).
+    pub upstream_base: Url,
 }
 
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
-    pub fn new(config: Config, prom: PrometheusHandle) -> SharedState {
-        Arc::new(AppState {
+    pub fn new(config: Config, prom: PrometheusHandle) -> anyhow::Result<SharedState> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_millis(config.gateway.request_timeout_ms))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()?;
+        let upstream_base = Url::parse(&config.gateway.upstream_base)?;
+
+        Ok(Arc::new(AppState {
             config,
             prom,
             started_at: OffsetDateTime::now_utc(),
-        })
+            http,
+            upstream_base,
+        }))
     }
 
     /// Seconds the process has been running.

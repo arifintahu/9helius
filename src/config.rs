@@ -130,6 +130,13 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Parse configuration directly from a TOML string (used by tests).
+    pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
+        let cfg: Config = toml::from_str(s)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         if self.gateway.api_key.trim().is_empty() {
             anyhow::bail!("gateway.api_key must not be empty");
