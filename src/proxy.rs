@@ -7,6 +7,8 @@
 //!
 //! M1: single upstream key, no round-robin / credits / rate-limit handling yet.
 
+use std::sync::atomic::Ordering;
+
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::{header, HeaderMap, HeaderName, Method};
@@ -14,8 +16,8 @@ use axum::response::{IntoResponse, Response};
 use tracing::{debug, warn};
 use url::Url;
 
-use crate::config::UpstreamConfig;
 use crate::error::ProxyError;
+use crate::metrics::names;
 use crate::state::SharedState;
 
 /// Headers that must not be forwarded hop-to-hop (RFC 7230 §6.1) plus `host`,
@@ -61,13 +63,16 @@ async fn proxy(
         return Err(ProxyError::PayloadTooLarge);
     }
 
-    // 3. Pick an upstream (M1: first enabled key).
-    let upstream = select_upstream(state).ok_or(ProxyError::AllUpstreamsExhausted {
-        retry_after_secs: None,
-    })?;
+    // 3. Pick an upstream (M2: round-robin over enabled keys).
+    let upstream = state
+        .pool
+        .select_round_robin()
+        .ok_or(ProxyError::AllUpstreamsExhausted {
+            retry_after_secs: None,
+        })?;
 
-    // 4. Forward.
-    let url = build_upstream_url(&state.upstream_base, &uri, &upstream.api_key)?;
+    // 4. Forward, tracking in-flight load and request outcome.
+    let url = build_upstream_url(&state.upstream_base, &uri, upstream.api_key.expose())?;
     debug!(upstream = %upstream.name, method = %method, path = uri.path(), "forwarding");
 
     let mut req = state.http.request(method, url);
@@ -78,12 +83,32 @@ async fn proxy(
         req = req.header(name, value);
     }
 
-    let resp = req.body(body).send().await.map_err(|e| {
-        warn!(upstream = %upstream.name, error = %e, "upstream request failed");
-        ProxyError::BadGateway(e.to_string())
-    })?;
+    upstream.in_flight.fetch_add(1, Ordering::AcqRel);
+    metrics::gauge!(names::INFLIGHT, "upstream" => upstream.name.clone()).increment(1.0);
 
-    relay_response(resp).await
+    let result = req.body(body).send().await;
+
+    upstream.in_flight.fetch_sub(1, Ordering::AcqRel);
+    metrics::gauge!(names::INFLIGHT, "upstream" => upstream.name.clone()).decrement(1.0);
+
+    match result {
+        Ok(resp) => {
+            metrics::counter!(names::REQUESTS_TOTAL,
+                "upstream" => upstream.name.clone(), "outcome" => "ok")
+            .increment(1);
+            relay_response(resp).await
+        }
+        Err(e) => {
+            warn!(upstream = %upstream.name, error = %e, "upstream request failed");
+            metrics::counter!(names::REQUESTS_TOTAL,
+                "upstream" => upstream.name.clone(), "outcome" => "error")
+            .increment(1);
+            metrics::counter!(names::UPSTREAM_ERRORS_TOTAL,
+                "upstream" => upstream.name.clone(), "kind" => "transient")
+            .increment(1);
+            Err(ProxyError::BadGateway(e.to_string()))
+        }
+    }
 }
 
 /// Validate the gateway api-key, supplied as `?api-key=`, `x-api-key:`, or
@@ -116,11 +141,6 @@ fn check_gateway_auth(
         }
     }
     Err(ProxyError::Unauthorized)
-}
-
-/// M1 selection: first enabled upstream. Replaced by round-robin in M2.
-fn select_upstream(state: &SharedState) -> Option<&UpstreamConfig> {
-    state.config.upstreams.iter().find(|u| u.enabled)
 }
 
 /// Build the upstream URL: base host + original path + original query with the

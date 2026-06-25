@@ -12,6 +12,7 @@ pub mod error;
 pub mod metrics;
 pub mod proxy;
 pub mod state;
+pub mod upstream;
 
 use axum::routing::get;
 use axum::Router;

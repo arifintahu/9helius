@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 use url::Url;
 
 use crate::config::Config;
+use crate::upstream::Pool;
 
 /// Process-wide shared state.
 pub struct AppState {
@@ -22,6 +23,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Pre-parsed upstream base URL (only the api-key query param is rewritten).
     pub upstream_base: Url,
+    /// The pool of upstream keys with round-robin selection.
+    pub pool: Pool,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -33,6 +36,7 @@ impl AppState {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()?;
         let upstream_base = Url::parse(&config.gateway.upstream_base)?;
+        let pool = Pool::from_config(&config.upstreams);
 
         Ok(Arc::new(AppState {
             config,
@@ -40,6 +44,7 @@ impl AppState {
             started_at: OffsetDateTime::now_utc(),
             http,
             upstream_base,
+            pool,
         }))
     }
 
