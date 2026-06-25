@@ -29,10 +29,17 @@ pub fn init_recorder() -> anyhow::Result<PrometheusHandle> {
     Ok(handle)
 }
 
-/// `GET /health` — 200 while the process is up. Capacity-aware readiness is
-/// refined in a later milestone once cooldown/quota state is wired in.
-pub async fn health() -> impl IntoResponse {
-    (StatusCode::OK, axum::Json(serde_json::json!({ "status": "ok" })))
+/// `GET /health` — 200 if at least one key has quota left, else 503 so a load
+/// balancer can react when every key is exhausted.
+pub async fn health(State(state): State<SharedState>) -> impl IntoResponse {
+    if state.pool.has_available_capacity() {
+        (StatusCode::OK, axum::Json(serde_json::json!({ "status": "ok" })))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "status": "exhausted" })),
+        )
+    }
 }
 
 /// `GET /metrics` — Prometheus text exposition.

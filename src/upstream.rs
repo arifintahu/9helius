@@ -204,12 +204,12 @@ impl Pool {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.upstreams.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.upstreams.is_empty()
+    /// True if at least one key is enabled and has monthly quota left (cooldown
+    /// is transient, so it doesn't count against capacity).
+    pub fn has_available_capacity(&self) -> bool {
+        self.upstreams
+            .iter()
+            .any(|u| u.is_enabled() && u.remaining_credits() > 0)
     }
 
     /// Select an upstream for a request of the given `class` and `est_cost`,

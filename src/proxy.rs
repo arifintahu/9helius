@@ -11,13 +11,14 @@
 //! request is retried on the next available key.
 
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 use url::Url;
 
 use crate::credits::{self, Parsed};
@@ -60,7 +61,13 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match proxy(&state, method, uri, headers, body).await {
+    let span = tracing::info_span!("request", method = %method, path = uri.path());
+    let start = Instant::now();
+    let result = proxy(&state, method, uri, headers, body)
+        .instrument(span)
+        .await;
+    metrics::histogram!(names::REQUEST_DURATION_SECONDS).record(start.elapsed().as_secs_f64());
+    match result {
         Ok(resp) => resp,
         Err(e) => e.into_response(),
     }

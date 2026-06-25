@@ -3,10 +3,6 @@
 //! Library root. The `ninehelius` binary is a thin wrapper around [`router`] and
 //! [`state::AppState`]; exposing them here lets integration tests build the app.
 
-// Some items are introduced a milestone before their first use; this is removed
-// during the final hardening pass.
-#![allow(dead_code)]
-
 pub mod config;
 pub mod credits;
 pub mod error;
