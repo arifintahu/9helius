@@ -54,11 +54,19 @@ pub async fn prometheus(State(state): State<SharedState>) -> impl IntoResponse {
 
 /// `GET /stats` — operator-friendly JSON snapshot.
 pub async fn stats(State(state): State<SharedState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
     let upstreams = state.pool.stats(crate::ratelimit::now_ms());
     let body = serde_json::json!({
         "uptime_secs": state.uptime_secs(),
         "gateway_bind": state.config.gateway.bind,
+        "current_month": state.stats.current_month.load(Ordering::Acquire),
+        "all_exhausted_total": state.stats.all_exhausted.load(Ordering::Acquire),
         "upstreams": upstreams,
     });
     (StatusCode::OK, axum::Json(body))
+}
+
+/// `GET /stats/history` — the in-progress month plus all closed monthly periods.
+pub async fn stats_history(State(state): State<SharedState>) -> impl IntoResponse {
+    (StatusCode::OK, axum::Json(state.stats.history_view(&state.pool)))
 }

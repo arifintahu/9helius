@@ -106,6 +106,7 @@ async fn proxy(
         match result {
             Ok(buf) if is_rate_limited(&buf) => {
                 upstream.trip_cooldown(now);
+                upstream.record_rate_limited();
                 debug!(upstream = %upstream.name, "upstream rate-limited; cooling down, retrying");
                 metrics::counter!(names::RATE_LIMIT_HITS_TOTAL, "upstream" => upstream.name.clone())
                     .increment(1);
@@ -117,7 +118,8 @@ async fn proxy(
             }
             Ok(buf) => {
                 upstream.note_success();
-                commit_credits(&upstream, est, &parsed);
+                upstream.record_ok();
+                commit_credits(state, &upstream, est, &parsed);
                 metrics::counter!(names::REQUESTS_TOTAL,
                     "upstream" => upstream.name.clone(), "outcome" => "ok")
                 .increment(1);
@@ -125,6 +127,7 @@ async fn proxy(
             }
             Err(e) => {
                 warn!(upstream = %upstream.name, error = %e, "upstream request failed");
+                upstream.record_error();
                 metrics::counter!(names::UPSTREAM_ERRORS_TOTAL,
                     "upstream" => upstream.name.clone(), "kind" => "transient")
                 .increment(1);
@@ -142,7 +145,7 @@ async fn proxy(
 
 /// Build the all-upstreams-exhausted error with a Retry-After hint and metric.
 fn exhausted(state: &SharedState, now_ms: u64) -> ProxyError {
-    metrics::counter!(names::ALL_EXHAUSTED_TOTAL).increment(1);
+    state.stats.record_exhausted();
     ProxyError::AllUpstreamsExhausted {
         retry_after_secs: state.pool.soonest_cooldown_secs(now_ms),
     }
@@ -215,16 +218,14 @@ fn first_non_ws(body: &[u8]) -> Option<u8> {
     body.iter().copied().find(|b| !b.is_ascii_whitespace())
 }
 
-/// Charge credits to the chosen key and update the related metrics.
-fn commit_credits(upstream: &Upstream, est: u64, parsed: &Parsed) {
+/// Charge credits to the chosen key and update the related metrics + tallies.
+fn commit_credits(state: &SharedState, upstream: &Upstream, est: u64, parsed: &Parsed) {
     let used = upstream.add_credits(est);
     metrics::counter!(names::CREDITS_CONSUMED_TOTAL, "upstream" => upstream.name.clone())
         .increment(est);
     metrics::gauge!(names::CREDITS_REMAINING, "upstream" => upstream.name.clone())
         .set(upstream.credit_cap.saturating_sub(used) as f64);
-    for method in credits::methods(parsed) {
-        metrics::counter!(names::RPC_METHOD_TOTAL, "method" => method.to_string()).increment(1);
-    }
+    state.stats.record_methods(parsed);
 }
 
 /// Validate the gateway api-key, supplied as `?api-key=`, `x-api-key:`, or

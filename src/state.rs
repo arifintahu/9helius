@@ -13,6 +13,7 @@ use url::Url;
 
 use crate::config::Config;
 use crate::credits::CostTable;
+use crate::stats::Stats;
 use crate::upstream::Pool;
 
 /// Process-wide shared state.
@@ -28,6 +29,8 @@ pub struct AppState {
     pub pool: Pool,
     /// Resolved per-method credit cost table.
     pub costs: CostTable,
+    /// Durable global statistics and monthly history.
+    pub stats: Stats,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -50,6 +53,7 @@ impl AppState {
             upstream_base,
             pool,
             costs,
+            stats: Stats::new(),
         }))
     }
 

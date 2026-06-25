@@ -10,7 +10,7 @@ failover, and per-key credit accounting.
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-36%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-38%20passing-brightgreen.svg)](#testing)
 [![Status](https://img.shields.io/badge/status-v0.1-yellow.svg)](#roadmap)
 
 </div>
@@ -62,8 +62,11 @@ one has burned.
 - 🛡️ **Rate-limit handling** — proactive per-key/per-class token buckets, plus
   reactive failover: on HTTP `429` or JSON-RPC `-32005`, the key is put on an
   exponential-backoff cooldown and the request retries the next available key.
-- ♻️ **Survives restarts** — per-key usage is snapshotted atomically and restored
-  on boot; counters reset automatically at each UTC month boundary.
+- ♻️ **Fully durable** — every counter (per-key credits, lifetime totals,
+  per-method tallies, global counters) is snapshotted atomically and restored on
+  boot, then **replayed into Prometheus so `/metrics` resumes** instead of
+  restarting at zero. Monthly counters reset at each UTC boundary, and the closed
+  month is archived to a queryable **history**.
 - 📊 **Observable** — Prometheus `/metrics`, a JSON `/stats` view, and a
   capacity-aware `/health` probe.
 - 🔒 **Secret-safe** — real keys live only in a gitignored config and are redacted
@@ -114,8 +117,9 @@ const rpc = new Connection("http://host:8080/?api-key=YOUR_GATEWAY_KEY");
 | Path        | Method | Description                                                  |
 |-------------|:------:|--------------------------------------------------------------|
 | `/health`   | GET    | `200` if any key has quota left, `503` if all are exhausted  |
-| `/metrics`  | GET    | Prometheus exposition                                        |
-| `/stats`    | GET    | JSON: per-key credits, remaining, in-flight, cooldown        |
+| `/metrics`  | GET    | Prometheus exposition (resumes from persisted totals on restart) |
+| `/stats`    | GET    | JSON: per-key monthly + lifetime credits, requests, cooldown |
+| `/stats/history` | GET | JSON: the in-progress month plus all closed monthly periods |
 | *anything else* | any | Proxied transparently to the upstream Helius host          |
 
 `/health`, `/metrics`, and `/stats` are the only reserved paths; everything else
@@ -171,8 +175,8 @@ NINEHELIUS_UPSTREAMS__0__API_KEY=…
 | **Cost**       | Estimated from the JSON-RPC method. Standard = 1, `getProgramAccounts`/DAS/ZK = 10, `getValidityProofs` = 100. Batches sum their calls. Charged only after a serviced (non-rate-limited) response. |
 | **Selection**  | Round-robin, skipping keys that are disabled, over their monthly cap, on cooldown, or out of RPS tokens for the request's class. |
 | **Rate limits**| Proactive token buckets per key per class. On `429`/`-32005`, the key cools down (1s→30s exponential, ±25% jitter) and the request retries the next key. All keys unavailable → `429` + `Retry-After`. |
-| **Persistence**| Usage snapshotted to disk (atomic temp-file + rename), restored on boot only if the snapshot is from the current UTC month. |
-| **Reset**      | Per-key counters reset automatically at each UTC month boundary.                                            |
+| **Persistence**| All durable state (monthly + lifetime credits, request/rate-limit counters, per-method tallies, global counters, monthly history) is snapshotted to disk (atomic temp-file + rename, default every 10s and on shutdown) and restored on boot. Restored totals are replayed into Prometheus so `/metrics` continues seamlessly. |
+| **Reset**      | At each UTC month boundary the ending month is archived to history and per-key *monthly* counters reset; *lifetime* counters never reset. |
 
 ## Metrics
 

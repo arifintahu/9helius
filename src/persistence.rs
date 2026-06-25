@@ -1,11 +1,16 @@
-//! Credit-usage persistence: an atomic JSON snapshot that survives restarts.
+//! Durable state: an atomic JSON snapshot that survives restarts.
 //!
-//! State is tiny (a few rows), single-writer, and authoritative in RAM. We flush
-//! a snapshot periodically and on shutdown via a temp-file + rename so a crash
-//! mid-write can't corrupt the file. On boot we restore usage only if the
-//! snapshot is from the current UTC month (otherwise the month rolled over while
-//! we were down, so everyone starts fresh).
+//! The snapshot captures everything we don't want to lose on restart — per-key
+//! monthly usage *and* lifetime counters, global counters, per-method tallies,
+//! and the closed monthly history. It's flushed periodically and on shutdown via
+//! temp-file + rename so a crash mid-write can't corrupt it.
+//!
+//! On boot, [`restore_into`] rehydrates the in-memory atomics and replays the
+//! totals into Prometheus so `/metrics` resumes rather than restarting at zero.
+//! Monthly counters are restored only if the snapshot is from the current UTC
+//! month; otherwise that month is closed into history and counters start fresh.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
@@ -13,26 +18,51 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::{PersistenceConfig, SnapshotErrorPolicy};
+use crate::stats::{replay_to_prometheus, MonthlyRecord, MonthlyUpstream, Stats};
 use crate::upstream::{current_yyyymm, Pool};
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Current on-disk schema version.
+const SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub version: u32,
+    /// Accounting month the `credits_used` values belong to.
     pub epoch_yyyymm: u32,
     pub saved_at_ms: u64,
     pub upstreams: Vec<UpstreamSnap>,
+    #[serde(default)]
+    pub all_exhausted: u64,
+    #[serde(default)]
+    pub methods: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub history: Vec<MonthlyRecord>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct UpstreamSnap {
     pub name: String,
+    /// Credits used in `epoch_yyyymm`.
     pub credits_used: u64,
+    #[serde(default)]
+    pub credits_total: u64,
+    #[serde(default)]
+    pub requests_ok: u64,
+    #[serde(default)]
+    pub requests_rate_limited: u64,
+    #[serde(default)]
+    pub requests_error: u64,
+    #[serde(default)]
+    pub rate_limit_hits: u64,
 }
 
 impl Snapshot {
-    /// Capture current usage from the pool.
-    pub fn capture(pool: &Pool, cur_yyyymm: u32, now_ms: u64) -> Self {
+    /// Capture the full durable state from the pool and global stats.
+    pub fn capture(pool: &Pool, stats: &Stats, now_ms: u64) -> Self {
         Snapshot {
-            epoch_yyyymm: cur_yyyymm,
+            version: SCHEMA_VERSION,
+            epoch_yyyymm: stats.current_month.load(Ordering::Acquire),
             saved_at_ms: now_ms,
             upstreams: pool
                 .upstreams
@@ -40,8 +70,16 @@ impl Snapshot {
                 .map(|u| UpstreamSnap {
                     name: u.name.clone(),
                     credits_used: u.credits_used(),
+                    credits_total: u.credits_total(),
+                    requests_ok: u.requests_ok(),
+                    requests_rate_limited: u.requests_rate_limited(),
+                    requests_error: u.requests_error(),
+                    rate_limit_hits: u.rate_limit_hits(),
                 })
                 .collect(),
+            all_exhausted: stats.all_exhausted.load(Ordering::Acquire),
+            methods: stats.methods.lock().unwrap().clone(),
+            history: stats.history.lock().unwrap().clone(),
         }
     }
 }
@@ -71,37 +109,16 @@ pub fn save(path: &Path, snap: &Snapshot) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Initialize every key's month epoch and restore prior usage where applicable.
-///
-/// - snapshot present & same month → restore credits by name
-/// - snapshot present but older month → start at zero (month already rolled over)
-/// - snapshot absent → start at zero
-/// - snapshot corrupt → apply `policy` (zero, or assume each key at its cap)
-pub fn restore_into(pool: &Pool, cfg: &PersistenceConfig) {
+/// Restore durable state into the pool and stats, then replay totals into the
+/// Prometheus recorder.
+pub fn restore_into(pool: &Pool, stats: &Stats, cfg: &PersistenceConfig) {
     let cur = current_yyyymm();
 
     match load(&cfg.path) {
-        Ok(Some(snap)) if snap.epoch_yyyymm == cur => {
-            for up in &pool.upstreams {
-                let used = snap
-                    .upstreams
-                    .iter()
-                    .find(|s| s.name == up.name)
-                    .map(|s| s.credits_used)
-                    .unwrap_or(0);
-                up.restore(cur, used);
-            }
-            info!(month = cur, "restored credit usage from snapshot");
-        }
-        Ok(Some(_)) => {
-            for up in &pool.upstreams {
-                up.restore(cur, 0);
-            }
-            info!("snapshot is from a previous month; starting fresh");
-        }
+        Ok(Some(snap)) => apply_snapshot(pool, stats, snap, cur),
         Ok(None) => {
             for up in &pool.upstreams {
-                up.restore(cur, 0);
+                up.restore_monthly(cur, 0);
             }
         }
         Err(e) => {
@@ -109,20 +126,76 @@ pub fn restore_into(pool: &Pool, cfg: &PersistenceConfig) {
             warn!(error = %e, fail_closed = fill_cap, "snapshot unreadable; applying policy");
             for up in &pool.upstreams {
                 let used = if fill_cap { up.credit_cap } else { 0 };
-                up.restore(cur, used);
-                if fill_cap {
-                    // restore() set credits to cap, but keep the atomic explicit
-                    up.credits_used.store(up.credit_cap, Ordering::Release);
-                }
+                up.restore_monthly(cur, used);
             }
         }
+    }
+
+    stats.current_month.store(cur, Ordering::Release);
+    replay_to_prometheus(pool, stats);
+}
+
+fn apply_snapshot(pool: &Pool, stats: &Stats, snap: Snapshot, cur: u32) {
+    // Lifetime counters and global stats are restored regardless of month.
+    for up in &pool.upstreams {
+        if let Some(s) = snap.upstreams.iter().find(|s| s.name == up.name) {
+            up.restore_lifetime(
+                s.credits_total,
+                s.requests_ok,
+                s.requests_rate_limited,
+                s.requests_error,
+                s.rate_limit_hits,
+            );
+        }
+    }
+    stats.all_exhausted.store(snap.all_exhausted, Ordering::Release);
+    *stats.methods.lock().unwrap() = snap.methods;
+    *stats.history.lock().unwrap() = snap.history;
+
+    if snap.epoch_yyyymm == cur {
+        for up in &pool.upstreams {
+            let used = snap
+                .upstreams
+                .iter()
+                .find(|s| s.name == up.name)
+                .map(|s| s.credits_used)
+                .unwrap_or(0);
+            up.restore_monthly(cur, used);
+        }
+        info!(month = cur, "restored full stats from snapshot");
+    } else {
+        // The month rolled over while we were down: close the snapshot's month
+        // into history, then start the new month fresh.
+        if snap.epoch_yyyymm != 0 {
+            let record = MonthlyRecord {
+                month: snap.epoch_yyyymm,
+                total_credits: snap.upstreams.iter().map(|s| s.credits_used).sum(),
+                upstreams: snap
+                    .upstreams
+                    .iter()
+                    .map(|s| MonthlyUpstream {
+                        name: s.name.clone(),
+                        credits_used: s.credits_used,
+                    })
+                    .collect(),
+            };
+            stats.history.lock().unwrap().push(record);
+        }
+        for up in &pool.upstreams {
+            up.restore_monthly(cur, 0);
+        }
+        info!(
+            prev = snap.epoch_yyyymm,
+            month = cur,
+            "snapshot from a previous month; closed into history, monthly counters reset"
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{PersistenceConfig, RpsConfig, SnapshotErrorPolicy, UpstreamConfig};
+    use crate::config::{RpsConfig, UpstreamConfig};
 
     fn cfg(name: &str) -> UpstreamConfig {
         UpstreamConfig {
@@ -133,33 +206,15 @@ mod tests {
         }
     }
 
+    fn pool(names: &[&str]) -> Pool {
+        let cfgs: Vec<UpstreamConfig> = names.iter().map(|n| cfg(n)).collect();
+        Pool::from_config(&cfgs, &RpsConfig::default())
+    }
+
     fn temp_path(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("ninehelius-test-{tag}-{}.json", std::process::id()));
         p
-    }
-
-    #[test]
-    fn save_then_load_roundtrips() {
-        let pool = Pool::from_config(&[cfg("a"), cfg("b")], &RpsConfig::default());
-        pool.upstreams[0].add_credits(123);
-        pool.upstreams[1].add_credits(456);
-        let path = temp_path("roundtrip");
-        let snap = Snapshot::capture(&pool, 202606, 999);
-        save(&path, &snap).unwrap();
-
-        let loaded = load(&path).unwrap().unwrap();
-        assert_eq!(loaded.epoch_yyyymm, 202606);
-        assert_eq!(loaded.upstreams.len(), 2);
-        assert_eq!(loaded.upstreams[0].credits_used, 123);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn missing_file_is_none() {
-        let path = temp_path("missing-xyz");
-        let _ = std::fs::remove_file(&path);
-        assert!(load(&path).unwrap().is_none());
     }
 
     fn pcfg(path: std::path::PathBuf) -> PersistenceConfig {
@@ -171,52 +226,107 @@ mod tests {
     }
 
     #[test]
-    fn restore_same_month_restores_usage() {
-        let pool = Pool::from_config(&[cfg("a"), cfg("b")], &RpsConfig::default());
+    fn save_then_load_roundtrips_all_fields() {
+        let pool = pool(&["a", "b"]);
+        pool.upstreams[0].add_credits(123);
+        pool.upstreams[0].record_ok();
+        pool.upstreams[1].add_credits(456);
+        let stats = Stats::new();
+        stats.current_month.store(202606, Ordering::Release);
+        stats.record_exhausted();
+        {
+            let mut m = stats.methods.lock().unwrap();
+            m.insert("getSlot".into(), 9);
+        }
+
+        let path = temp_path("roundtrip");
+        save(&path, &Snapshot::capture(&pool, &stats, 999)).unwrap();
+
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.version, SCHEMA_VERSION);
+        assert_eq!(loaded.epoch_yyyymm, 202606);
+        assert_eq!(loaded.upstreams[0].credits_used, 123);
+        assert_eq!(loaded.upstreams[0].credits_total, 123);
+        assert_eq!(loaded.upstreams[0].requests_ok, 1);
+        assert_eq!(loaded.all_exhausted, 1);
+        assert_eq!(loaded.methods.get("getSlot"), Some(&9));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_file_is_none() {
+        let path = temp_path("missing-xyz");
+        let _ = std::fs::remove_file(&path);
+        assert!(load(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_same_month_restores_usage_and_lifetime() {
+        let pool = pool(&["a", "b"]);
         let path = temp_path("restore-same");
         let snap = Snapshot {
+            version: SCHEMA_VERSION,
             epoch_yyyymm: current_yyyymm(),
             saved_at_ms: 0,
             upstreams: vec![
                 UpstreamSnap {
                     name: "a".into(),
                     credits_used: 500,
+                    credits_total: 1500,
+                    requests_ok: 42,
+                    ..Default::default()
                 },
                 UpstreamSnap {
                     name: "b".into(),
                     credits_used: 7,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         save(&path, &snap).unwrap();
 
-        restore_into(&pool, &pcfg(path.clone()));
+        let stats = Stats::new();
+        restore_into(&pool, &stats, &pcfg(path.clone()));
         assert_eq!(pool.find("a").unwrap().credits_used(), 500);
+        assert_eq!(pool.find("a").unwrap().credits_total(), 1500);
+        assert_eq!(pool.find("a").unwrap().requests_ok(), 42);
         assert_eq!(pool.find("b").unwrap().credits_used(), 7);
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn restore_old_month_starts_fresh() {
-        let pool = Pool::from_config(&[cfg("a")], &RpsConfig::default());
+    fn restore_old_month_keeps_lifetime_and_records_history() {
+        let pool = pool(&["a"]);
         let path = temp_path("restore-old");
         let snap = Snapshot {
+            version: SCHEMA_VERSION,
             epoch_yyyymm: 200001, // ancient
             saved_at_ms: 0,
             upstreams: vec![UpstreamSnap {
                 name: "a".into(),
                 credits_used: 500,
+                credits_total: 9000,
+                ..Default::default()
             }],
+            ..Default::default()
         };
         save(&path, &snap).unwrap();
 
-        restore_into(&pool, &pcfg(path.clone()));
+        let stats = Stats::new();
+        restore_into(&pool, &stats, &pcfg(path.clone()));
+        // monthly reset, lifetime preserved
         assert_eq!(pool.find("a").unwrap().credits_used(), 0);
-        // Epoch is initialized to the current month so no spurious reset later.
+        assert_eq!(pool.find("a").unwrap().credits_total(), 9000);
         assert_eq!(
             pool.find("a").unwrap().epoch_yyyymm.load(Ordering::Acquire),
             current_yyyymm()
         );
+        // the ended month was closed into history
+        let hist = stats.history.lock().unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].month, 200001);
+        assert_eq!(hist[0].total_credits, 500);
         let _ = std::fs::remove_file(&path);
     }
 }

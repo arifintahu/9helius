@@ -28,8 +28,9 @@ async fn main() -> anyhow::Result<()> {
     let bind = config.gateway.bind;
     let state = AppState::new(config, prom)?;
 
-    // Restore credit usage from the last snapshot (current month only).
-    persistence::restore_into(&state.pool, &state.config.persistence);
+    // Restore all durable state (credits, lifetime counters, history) and replay
+    // it into Prometheus so /metrics resumes.
+    persistence::restore_into(&state.pool, &state.stats, &state.config.persistence);
 
     spawn_snapshot_writer(state.clone());
     spawn_month_reset_ticker(state.clone());
@@ -61,19 +62,22 @@ fn spawn_snapshot_writer(state: SharedState) {
     });
 }
 
-/// Reset per-key monthly counters shortly after each UTC month boundary.
+/// Close out and reset per-key monthly counters at each UTC month boundary,
+/// recording the ended month into history.
 fn spawn_month_reset_ticker(state: SharedState) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            state.pool.reset_month_all(current_yyyymm());
+            state
+                .stats
+                .roll_month_if_changed(&state.pool, current_yyyymm());
         }
     });
 }
 
 fn save_snapshot(state: &SharedState) {
-    let snap = persistence::Snapshot::capture(&state.pool, current_yyyymm(), ratelimit::now_ms());
+    let snap = persistence::Snapshot::capture(&state.pool, &state.stats, ratelimit::now_ms());
     if let Err(e) = persistence::save(&state.config.persistence.path, &snap) {
         warn!(error = %e, "snapshot save failed");
     }

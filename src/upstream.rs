@@ -66,6 +66,14 @@ pub struct Upstream {
 
     pub enabled: AtomicBool,
 
+    // ---- lifetime counters: persisted, never reset (basis for /metrics + history) ----
+    /// Total credits ever charged to this key (across all months).
+    pub credits_total: AtomicU64,
+    pub requests_ok: AtomicU64,
+    pub requests_rate_limited: AtomicU64,
+    pub requests_error: AtomicU64,
+    pub rate_limit_hits: AtomicU64,
+
     /// Proactive RPS token buckets, one per method class.
     limiters: HashMap<MethodClass, Limiter>,
 }
@@ -82,12 +90,47 @@ impl Upstream {
             backoff_step: AtomicU32::new(0),
             in_flight: AtomicU32::new(0),
             enabled: AtomicBool::new(c.enabled),
+            credits_total: AtomicU64::new(0),
+            requests_ok: AtomicU64::new(0),
+            requests_rate_limited: AtomicU64::new(0),
+            requests_error: AtomicU64::new(0),
+            rate_limit_hits: AtomicU64::new(0),
             limiters: ratelimit::build_limiters(rps),
         }
     }
 
     pub fn credits_used(&self) -> u64 {
         self.credits_used.load(Ordering::Acquire)
+    }
+
+    pub fn credits_total(&self) -> u64 {
+        self.credits_total.load(Ordering::Acquire)
+    }
+    pub fn requests_ok(&self) -> u64 {
+        self.requests_ok.load(Ordering::Acquire)
+    }
+    pub fn requests_rate_limited(&self) -> u64 {
+        self.requests_rate_limited.load(Ordering::Acquire)
+    }
+    pub fn requests_error(&self) -> u64 {
+        self.requests_error.load(Ordering::Acquire)
+    }
+    pub fn rate_limit_hits(&self) -> u64 {
+        self.rate_limit_hits.load(Ordering::Acquire)
+    }
+
+    /// Record a successful (serviced) request.
+    pub fn record_ok(&self) {
+        self.requests_ok.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record a rate-limited response (429 / -32005).
+    pub fn record_rate_limited(&self) {
+        self.requests_rate_limited.fetch_add(1, Ordering::Relaxed);
+        self.rate_limit_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Record a transient upstream error.
+    pub fn record_error(&self) {
+        self.requests_error.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn remaining_credits(&self) -> u64 {
@@ -99,8 +142,10 @@ impl Upstream {
         self.credits_used().saturating_add(cost) <= self.credit_cap
     }
 
-    /// Commit `cost` credits against this key, returning the new total.
+    /// Commit `cost` credits against this key, returning the new monthly total.
+    /// Bumps both the monthly counter and the lifetime total.
     pub fn add_credits(&self, cost: u64) -> u64 {
+        self.credits_total.fetch_add(cost, Ordering::AcqRel);
         self.credits_used.fetch_add(cost, Ordering::AcqRel) + cost
     }
 
@@ -140,25 +185,34 @@ impl Upstream {
         }
     }
 
-    /// Zero the credit counter when the UTC month changes. Exactly one caller
-    /// wins the CAS, so concurrent callers can't double-reset.
-    pub fn maybe_reset_month(&self, cur_yyyymm: u32) {
-        let prev = self.epoch_yyyymm.load(Ordering::Acquire);
-        if prev != cur_yyyymm
-            && self
-                .epoch_yyyymm
-                .compare_exchange(prev, cur_yyyymm, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            self.credits_used.store(0, Ordering::Release);
-            self.backoff_step.store(0, Ordering::Release);
-        }
+    /// Reset the monthly credit counter and set the month epoch (rollover/boot).
+    /// Lifetime totals are preserved.
+    pub fn reset_monthly(&self, cur_yyyymm: u32) {
+        self.epoch_yyyymm.store(cur_yyyymm, Ordering::Release);
+        self.credits_used.store(0, Ordering::Release);
     }
 
-    /// Initialize the month epoch and (optionally) restore prior usage on boot.
-    pub fn restore(&self, cur_yyyymm: u32, credits_used: u64) {
+    /// Restore monthly usage and the month epoch on boot.
+    pub fn restore_monthly(&self, cur_yyyymm: u32, credits_used: u64) {
         self.epoch_yyyymm.store(cur_yyyymm, Ordering::Release);
         self.credits_used.store(credits_used, Ordering::Release);
+    }
+
+    /// Restore lifetime counters on boot.
+    pub fn restore_lifetime(
+        &self,
+        credits_total: u64,
+        requests_ok: u64,
+        requests_rate_limited: u64,
+        requests_error: u64,
+        rate_limit_hits: u64,
+    ) {
+        self.credits_total.store(credits_total, Ordering::Release);
+        self.requests_ok.store(requests_ok, Ordering::Release);
+        self.requests_rate_limited
+            .store(requests_rate_limited, Ordering::Release);
+        self.requests_error.store(requests_error, Ordering::Release);
+        self.rate_limit_hits.store(rate_limit_hits, Ordering::Release);
     }
 
     /// A point-in-time snapshot for the `/stats` endpoint.
@@ -168,6 +222,11 @@ impl Upstream {
             credits_used: self.credits_used(),
             credit_cap: self.credit_cap,
             remaining: self.remaining_credits(),
+            credits_total: self.credits_total(),
+            requests_ok: self.requests_ok(),
+            requests_rate_limited: self.requests_rate_limited(),
+            requests_error: self.requests_error(),
+            rate_limit_hits: self.rate_limit_hits(),
             in_flight: self.in_flight.load(Ordering::Acquire),
             cooldown_ms_left: self.cooldown_remaining_ms(now_ms),
             enabled: self.is_enabled(),
@@ -179,9 +238,16 @@ impl Upstream {
 #[derive(Debug, Serialize)]
 pub struct UpstreamStat {
     pub name: String,
+    /// Credits used this month (resets at the UTC month boundary).
     pub credits_used: u64,
     pub credit_cap: u64,
     pub remaining: u64,
+    /// Lifetime credits ever charged (never resets).
+    pub credits_total: u64,
+    pub requests_ok: u64,
+    pub requests_rate_limited: u64,
+    pub requests_error: u64,
+    pub rate_limit_hits: u64,
     pub in_flight: u32,
     pub cooldown_ms_left: u64,
     pub enabled: bool,
@@ -253,13 +319,6 @@ impl Pool {
             .filter(|&ms| ms > 0)
             .min()
             .map(|ms| ms.div_ceil(1000).max(1))
-    }
-
-    /// Apply the monthly reset to every key (called by the background ticker).
-    pub fn reset_month_all(&self, cur_yyyymm: u32) {
-        for up in &self.upstreams {
-            up.maybe_reset_month(cur_yyyymm);
-        }
     }
 
     /// Look up an upstream by name.

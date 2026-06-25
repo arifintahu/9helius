@@ -247,6 +247,129 @@ async fn e2e_health_503_when_exhausted() {
     assert_eq!(post_rpc(&base, "gw", "getSlot").await.status(), 429);
 }
 
+/// Sum every value of a Prometheus counter/gauge family in the exposition text.
+fn sum_metric(text: &str, name: &str) -> f64 {
+    text.lines()
+        .filter(|l| !l.starts_with('#') && l.starts_with(name))
+        .filter_map(|l| l.rsplit(' ').next())
+        .filter_map(|v| v.parse::<f64>().ok())
+        .sum()
+}
+
+#[tokio::test]
+async fn e2e_metrics_resume_after_restart() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": 1})))
+        .mount(&upstream)
+        .await;
+
+    let dir = unique_dir("metrics");
+    let snap = dir.join("snap.json");
+    let snap_s = snap.to_string_lossy().to_string();
+    let cfg_path = dir.join("config.toml");
+    let ups = [("u0", "k0", 1_000_000u64), ("u1", "k1", 1_000_000)];
+
+    // run 1: generate metric activity, let the snapshot flush.
+    let port1 = free_port();
+    std::fs::write(&cfg_path, config_toml(port1, &snap_s, &upstream.uri(), 1, &ups)).unwrap();
+    let g1 = spawn_bin(&cfg_path);
+    let base1 = format!("http://127.0.0.1:{port1}");
+    wait_ready(&base1).await;
+    for _ in 0..4 {
+        post_rpc(&base1, "gw", "getSlot").await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    drop(g1);
+
+    // run 2: Prometheus counters should resume from the persisted totals.
+    let port2 = free_port();
+    std::fs::write(&cfg_path, config_toml(port2, &snap_s, &upstream.uri(), 1, &ups)).unwrap();
+    let _g2 = spawn_bin(&cfg_path);
+    let base2 = format!("http://127.0.0.1:{port2}");
+    wait_ready(&base2).await;
+
+    let metrics = reqwest::get(format!("{base2}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        sum_metric(&metrics, "ninehelius_credits_consumed_total"),
+        4.0,
+        "credits_consumed_total should resume at 4 after restart"
+    );
+    assert_eq!(
+        sum_metric(&metrics, "ninehelius_rpc_method_total"),
+        4.0,
+        "rpc_method_total should resume at 4 after restart"
+    );
+
+    // /stats lifetime totals likewise survive.
+    let s = stats(&base2).await;
+    let lifetime: u64 = s["upstreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["credits_total"].as_u64().unwrap())
+        .sum();
+    assert_eq!(lifetime, 4);
+}
+
+#[tokio::test]
+async fn e2e_history_visible_after_month_rollover() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&upstream)
+        .await;
+
+    // Pre-seed a snapshot from an old month, then boot: the binary should close
+    // that month into history and expose it at /stats/history.
+    let dir = unique_dir("history");
+    let snap = dir.join("snap.json");
+    std::fs::write(
+        &snap,
+        json!({
+            "version": 2,
+            "epoch_yyyymm": 200001,
+            "saved_at_ms": 0,
+            "upstreams": [{"name":"u0","credits_used":5,"credits_total":5}],
+            "all_exhausted": 0,
+            "methods": {},
+            "history": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let port = free_port();
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        config_toml(port, &snap.to_string_lossy(), &upstream.uri(), 3600, &[("u0", "k0", 1_000_000)]),
+    )
+    .unwrap();
+    let _g = spawn_bin(&cfg_path);
+    let base = format!("http://127.0.0.1:{port}");
+    wait_ready(&base).await;
+
+    let hist: Value = reqwest::get(format!("{base}/stats/history"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let records = hist["history"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "expected one closed month, got {hist}");
+    assert_eq!(records[0]["month"], 200001);
+    assert_eq!(records[0]["total_credits"], 5);
+    // The lifetime total carried over even though the month reset.
+    assert_eq!(stats(&base).await["upstreams"][0]["credits_total"], 5);
+}
+
 #[tokio::test]
 async fn e2e_persists_credits_across_restart() {
     let upstream = MockServer::start().await;

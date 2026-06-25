@@ -11,6 +11,7 @@ pub mod persistence;
 pub mod proxy;
 pub mod ratelimit;
 pub mod state;
+pub mod stats;
 pub mod upstream;
 
 use axum::routing::get;
@@ -25,6 +26,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/health", get(metrics::health))
         .route("/metrics", get(metrics::prometheus))
         .route("/stats", get(metrics::stats))
+        .route("/stats/history", get(metrics::stats_history))
         .fallback(proxy::handle)
         .with_state(state)
 }
