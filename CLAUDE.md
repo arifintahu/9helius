@@ -84,6 +84,19 @@ build the router; `main.rs` is a small wrapper.
 
 Add tests at the layer that matches the change; keep `cargo clippy` clean.
 
+## Releasing
+
+Releases are cut by pushing a semver tag, which triggers
+`.github/workflows/release.yml` (test → build `x86_64-unknown-linux-gnu` on
+ubuntu-22.04 → publish a GitHub release with a `.tar.gz` + `.sha256`). The first
+release is **`v0.1.0`**.
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Keep `Cargo.toml` `version` in sync with the tag before tagging.
+
 ## Workflow conventions
 
 - **Commit on every meaningful increment** (each feature/passing test batch), not
