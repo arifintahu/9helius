@@ -11,6 +11,7 @@ pub mod config;
 pub mod credits;
 pub mod error;
 pub mod metrics;
+pub mod persistence;
 pub mod proxy;
 pub mod ratelimit;
 pub mod state;

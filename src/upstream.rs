@@ -17,6 +17,12 @@ use crate::config::{RpsConfig, UpstreamConfig};
 use crate::credits::MethodClass;
 use crate::ratelimit::{self, Limiter};
 
+/// Current UTC month encoded as `YYYYMM` (e.g. June 2026 → 202606).
+pub fn current_yyyymm() -> u32 {
+    let now = time::OffsetDateTime::now_utc();
+    now.year() as u32 * 100 + u8::from(now.month()) as u32
+}
+
 /// A string that never reveals itself in `Debug`/`Display` output.
 #[derive(Clone)]
 pub struct SecretString(String);
@@ -134,6 +140,27 @@ impl Upstream {
         }
     }
 
+    /// Zero the credit counter when the UTC month changes. Exactly one caller
+    /// wins the CAS, so concurrent callers can't double-reset.
+    pub fn maybe_reset_month(&self, cur_yyyymm: u32) {
+        let prev = self.epoch_yyyymm.load(Ordering::Acquire);
+        if prev != cur_yyyymm
+            && self
+                .epoch_yyyymm
+                .compare_exchange(prev, cur_yyyymm, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.credits_used.store(0, Ordering::Release);
+            self.backoff_step.store(0, Ordering::Release);
+        }
+    }
+
+    /// Initialize the month epoch and (optionally) restore prior usage on boot.
+    pub fn restore(&self, cur_yyyymm: u32, credits_used: u64) {
+        self.epoch_yyyymm.store(cur_yyyymm, Ordering::Release);
+        self.credits_used.store(credits_used, Ordering::Release);
+    }
+
     /// A point-in-time snapshot for the `/stats` endpoint.
     pub fn stat(&self, now_ms: u64) -> UpstreamStat {
         UpstreamStat {
@@ -226,6 +253,18 @@ impl Pool {
             .filter(|&ms| ms > 0)
             .min()
             .map(|ms| ms.div_ceil(1000).max(1))
+    }
+
+    /// Apply the monthly reset to every key (called by the background ticker).
+    pub fn reset_month_all(&self, cur_yyyymm: u32) {
+        for up in &self.upstreams {
+            up.maybe_reset_month(cur_yyyymm);
+        }
+    }
+
+    /// Look up an upstream by name.
+    pub fn find(&self, name: &str) -> Option<&Arc<Upstream>> {
+        self.upstreams.iter().find(|u| u.name == name)
     }
 
     pub fn stats(&self, now_ms: u64) -> Vec<UpstreamStat> {
