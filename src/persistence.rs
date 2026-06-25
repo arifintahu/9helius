@@ -18,11 +18,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::config::{PersistenceConfig, SnapshotErrorPolicy};
-use crate::stats::{replay_to_prometheus, MonthlyRecord, MonthlyUpstream, Stats};
-use crate::upstream::{current_yyyymm, Pool};
+use crate::stats::{replay_to_prometheus, DailyRecord, MonthlyRecord, Stats, UsagePoint};
+use crate::upstream::{current_yyyymm, current_yyyymmdd, Pool};
 
 /// Current on-disk schema version.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -38,6 +38,11 @@ pub struct Snapshot {
     pub methods: BTreeMap<String, u64>,
     #[serde(default)]
     pub history: Vec<MonthlyRecord>,
+    /// Day the `day_start_total` baselines belong to.
+    #[serde(default)]
+    pub current_day: u32,
+    #[serde(default)]
+    pub daily_history: Vec<DailyRecord>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -55,6 +60,9 @@ pub struct UpstreamSnap {
     pub requests_error: u64,
     #[serde(default)]
     pub rate_limit_hits: u64,
+    /// Lifetime total as of the start of `current_day`.
+    #[serde(default)]
+    pub day_start_total: u64,
 }
 
 impl Snapshot {
@@ -75,11 +83,14 @@ impl Snapshot {
                     requests_rate_limited: u.requests_rate_limited(),
                     requests_error: u.requests_error(),
                     rate_limit_hits: u.rate_limit_hits(),
+                    day_start_total: u.day_start_total(),
                 })
                 .collect(),
             all_exhausted: stats.all_exhausted.load(Ordering::Acquire),
             methods: stats.methods.lock().unwrap().clone(),
             history: stats.history.lock().unwrap().clone(),
+            current_day: stats.current_day.load(Ordering::Acquire),
+            daily_history: stats.daily_history.lock().unwrap().clone(),
         }
     }
 }
@@ -112,13 +123,15 @@ pub fn save(path: &Path, snap: &Snapshot) -> anyhow::Result<()> {
 /// Restore durable state into the pool and stats, then replay totals into the
 /// Prometheus recorder.
 pub fn restore_into(pool: &Pool, stats: &Stats, cfg: &PersistenceConfig) {
-    let cur = current_yyyymm();
+    let cur_month = current_yyyymm();
+    let cur_day = current_yyyymmdd();
 
     match load(&cfg.path) {
-        Ok(Some(snap)) => apply_snapshot(pool, stats, snap, cur),
+        Ok(Some(snap)) => apply_snapshot(pool, stats, snap, cur_month, cur_day, cfg.daily_retention_days),
         Ok(None) => {
             for up in &pool.upstreams {
-                up.restore_monthly(cur, 0);
+                up.restore_monthly(cur_month, 0);
+                up.start_new_day();
             }
         }
         Err(e) => {
@@ -126,17 +139,26 @@ pub fn restore_into(pool: &Pool, stats: &Stats, cfg: &PersistenceConfig) {
             warn!(error = %e, fail_closed = fill_cap, "snapshot unreadable; applying policy");
             for up in &pool.upstreams {
                 let used = if fill_cap { up.credit_cap } else { 0 };
-                up.restore_monthly(cur, used);
+                up.restore_monthly(cur_month, used);
+                up.start_new_day();
             }
         }
     }
 
-    stats.current_month.store(cur, Ordering::Release);
+    stats.current_month.store(cur_month, Ordering::Release);
+    stats.current_day.store(cur_day, Ordering::Release);
     replay_to_prometheus(pool, stats);
 }
 
-fn apply_snapshot(pool: &Pool, stats: &Stats, snap: Snapshot, cur: u32) {
-    // Lifetime counters and global stats are restored regardless of month.
+fn apply_snapshot(
+    pool: &Pool,
+    stats: &Stats,
+    snap: Snapshot,
+    cur_month: u32,
+    cur_day: u32,
+    daily_retention: usize,
+) {
+    // Lifetime counters and global stats are restored regardless of period.
     for up in &pool.upstreams {
         if let Some(s) = snap.upstreams.iter().find(|s| s.name == up.name) {
             up.restore_lifetime(
@@ -146,13 +168,16 @@ fn apply_snapshot(pool: &Pool, stats: &Stats, snap: Snapshot, cur: u32) {
                 s.requests_error,
                 s.rate_limit_hits,
             );
+            up.restore_day_start(s.day_start_total);
         }
     }
     stats.all_exhausted.store(snap.all_exhausted, Ordering::Release);
     *stats.methods.lock().unwrap() = snap.methods;
     *stats.history.lock().unwrap() = snap.history;
+    *stats.daily_history.lock().unwrap() = snap.daily_history;
 
-    if snap.epoch_yyyymm == cur {
+    // --- monthly ---
+    if snap.epoch_yyyymm == cur_month {
         for up in &pool.upstreams {
             let used = snap
                 .upstreams
@@ -160,12 +185,10 @@ fn apply_snapshot(pool: &Pool, stats: &Stats, snap: Snapshot, cur: u32) {
                 .find(|s| s.name == up.name)
                 .map(|s| s.credits_used)
                 .unwrap_or(0);
-            up.restore_monthly(cur, used);
+            up.restore_monthly(cur_month, used);
         }
-        info!(month = cur, "restored full stats from snapshot");
+        info!(month = cur_month, "restored full stats from snapshot");
     } else {
-        // The month rolled over while we were down: close the snapshot's month
-        // into history, then start the new month fresh.
         if snap.epoch_yyyymm != 0 {
             let record = MonthlyRecord {
                 month: snap.epoch_yyyymm,
@@ -173,7 +196,7 @@ fn apply_snapshot(pool: &Pool, stats: &Stats, snap: Snapshot, cur: u32) {
                 upstreams: snap
                     .upstreams
                     .iter()
-                    .map(|s| MonthlyUpstream {
+                    .map(|s| UsagePoint {
                         name: s.name.clone(),
                         credits_used: s.credits_used,
                     })
@@ -182,13 +205,24 @@ fn apply_snapshot(pool: &Pool, stats: &Stats, snap: Snapshot, cur: u32) {
             stats.history.lock().unwrap().push(record);
         }
         for up in &pool.upstreams {
-            up.restore_monthly(cur, 0);
+            up.restore_monthly(cur_month, 0);
         }
         info!(
             prev = snap.epoch_yyyymm,
-            month = cur,
+            month = cur_month,
             "snapshot from a previous month; closed into history, monthly counters reset"
         );
+    }
+
+    // --- daily ---
+    if snap.current_day != cur_day {
+        if snap.current_day != 0 {
+            // Close the snapshot's day using the restored lifetime/day baselines.
+            stats.push_daily(crate::stats::capture_day(pool, snap.current_day), daily_retention);
+        }
+        for up in &pool.upstreams {
+            up.start_new_day();
+        }
     }
 }
 
@@ -222,6 +256,7 @@ mod tests {
             path,
             interval_secs: 10,
             on_snapshot_error: SnapshotErrorPolicy::Zero,
+            daily_retention_days: 90,
         }
     }
 

@@ -23,6 +23,12 @@ pub fn current_yyyymm() -> u32 {
     now.year() as u32 * 100 + u8::from(now.month()) as u32
 }
 
+/// Current UTC day encoded as `YYYYMMDD` (e.g. 2026-06-25 → 20260625).
+pub fn current_yyyymmdd() -> u32 {
+    let now = time::OffsetDateTime::now_utc();
+    now.year() as u32 * 10_000 + u8::from(now.month()) as u32 * 100 + now.day() as u32
+}
+
 /// A string that never reveals itself in `Debug`/`Display` output.
 #[derive(Clone)]
 pub struct SecretString(String);
@@ -73,6 +79,9 @@ pub struct Upstream {
     pub requests_rate_limited: AtomicU64,
     pub requests_error: AtomicU64,
     pub rate_limit_hits: AtomicU64,
+    /// Lifetime `credits_total` as of the start of the current day; daily usage
+    /// is `credits_total - day_start_total`.
+    pub day_start_total: AtomicU64,
 
     /// Proactive RPS token buckets, one per method class.
     limiters: HashMap<MethodClass, Limiter>,
@@ -95,6 +104,7 @@ impl Upstream {
             requests_rate_limited: AtomicU64::new(0),
             requests_error: AtomicU64::new(0),
             rate_limit_hits: AtomicU64::new(0),
+            day_start_total: AtomicU64::new(0),
             limiters: ratelimit::build_limiters(rps),
         }
     }
@@ -117,6 +127,22 @@ impl Upstream {
     }
     pub fn rate_limit_hits(&self) -> u64 {
         self.rate_limit_hits.load(Ordering::Acquire)
+    }
+    pub fn day_start_total(&self) -> u64 {
+        self.day_start_total.load(Ordering::Acquire)
+    }
+    /// Credits used so far today (derived from the monotonic lifetime total).
+    pub fn daily_used(&self) -> u64 {
+        self.credits_total().saturating_sub(self.day_start_total())
+    }
+    /// Re-baseline daily usage to the current lifetime total (day rollover).
+    pub fn start_new_day(&self) {
+        self.day_start_total
+            .store(self.credits_total(), Ordering::Release);
+    }
+    /// Restore the day baseline on boot.
+    pub fn restore_day_start(&self, value: u64) {
+        self.day_start_total.store(value, Ordering::Release);
     }
 
     /// Record a successful (serviced) request.

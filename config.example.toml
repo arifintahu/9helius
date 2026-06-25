@@ -27,6 +27,8 @@ path = "state/credits.snapshot.json"
 interval_secs = 10
 # On unreadable/corrupt snapshot: "zero" (start fresh) or "cap" (assume keys full).
 on_snapshot_error = "zero"
+# How many closed days of usage to keep in the daily history (see /stats/history).
+daily_retention_days = 90
 
 # Per-method credit cost overrides. Built-in defaults already cover the common
 # cases (standard = 1, getProgramAccounts = 10, DAS = 10, ZK = 10); list here

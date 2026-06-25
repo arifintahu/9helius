@@ -10,7 +10,7 @@ failover, and per-key credit accounting.
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-38%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-41%20passing-brightgreen.svg)](#testing)
 [![Status](https://img.shields.io/badge/status-v0.1-yellow.svg)](#roadmap)
 
 </div>
@@ -119,7 +119,7 @@ const rpc = new Connection("http://host:8080/?api-key=YOUR_GATEWAY_KEY");
 | `/health`   | GET    | `200` if any key has quota left, `503` if all are exhausted  |
 | `/metrics`  | GET    | Prometheus exposition (resumes from persisted totals on restart) |
 | `/stats`    | GET    | JSON: per-key monthly + lifetime credits, requests, cooldown |
-| `/stats/history` | GET | JSON: the in-progress month plus all closed monthly periods |
+| `/stats/history` | GET | JSON: in-progress + closed **monthly** and **daily** usage periods |
 | *anything else* | any | Proxied transparently to the upstream Helius host          |
 
 `/health`, `/metrics`, and `/stats` are the only reserved paths; everything else
@@ -177,6 +177,7 @@ NINEHELIUS_UPSTREAMS__0__API_KEY=…
 | **Rate limits**| Proactive token buckets per key per class. On `429`/`-32005`, the key cools down (1s→30s exponential, ±25% jitter) and the request retries the next key. All keys unavailable → `429` + `Retry-After`. |
 | **Persistence**| All durable state (monthly + lifetime credits, request/rate-limit counters, per-method tallies, global counters, monthly history) is snapshotted to disk (atomic temp-file + rename, default every 10s and on shutdown) and restored on boot. Restored totals are replayed into Prometheus so `/metrics` continues seamlessly. |
 | **Reset**      | At each UTC month boundary the ending month is archived to history and per-key *monthly* counters reset; *lifetime* counters never reset. |
+| **History**    | A per-month archive (unbounded — tiny) plus a per-day archive of credit usage, retained for `persistence.daily_retention_days` (default 90). Both are persisted and served at `/stats/history`. |
 
 ## Metrics
 

@@ -49,6 +49,9 @@ pub struct PersistenceConfig {
     pub interval_secs: u64,
     #[serde(default)]
     pub on_snapshot_error: SnapshotErrorPolicy,
+    /// How many closed days of usage to retain in the daily history.
+    #[serde(default = "default_daily_retention_days")]
+    pub daily_retention_days: usize,
 }
 
 impl Default for PersistenceConfig {
@@ -57,6 +60,7 @@ impl Default for PersistenceConfig {
             path: default_snapshot_path(),
             interval_secs: default_interval_secs(),
             on_snapshot_error: SnapshotErrorPolicy::default(),
+            daily_retention_days: default_daily_retention_days(),
         }
     }
 }
@@ -188,6 +192,9 @@ fn default_snapshot_path() -> PathBuf {
 }
 fn default_interval_secs() -> u64 {
     10
+}
+fn default_daily_retention_days() -> usize {
+    90
 }
 fn default_rest_cost() -> u32 {
     100

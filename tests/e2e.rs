@@ -371,6 +371,59 @@ async fn e2e_history_visible_after_month_rollover() {
 }
 
 #[tokio::test]
+async fn e2e_daily_history_visible_after_day_rollover() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&upstream)
+        .await;
+
+    // Pre-seed a snapshot from a previous day; on boot the binary closes that
+    // day into the daily history.
+    let dir = unique_dir("daily");
+    let snap = dir.join("snap.json");
+    std::fs::write(
+        &snap,
+        json!({
+            "version": 3,
+            "epoch_yyyymm": 209901,            // future month so monthly stays put
+            "saved_at_ms": 0,
+            "upstreams": [{
+                "name":"u0", "credits_used":8, "credits_total":8, "day_start_total":0
+            }],
+            "current_day": 20200101,           // old day
+            "daily_history": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let port = free_port();
+    let cfg_path = dir.join("config.toml");
+    std::fs::write(
+        &cfg_path,
+        config_toml(port, &snap.to_string_lossy(), &upstream.uri(), 3600, &[("u0", "k0", 1_000_000)]),
+    )
+    .unwrap();
+    let _g = spawn_bin(&cfg_path);
+    let base = format!("http://127.0.0.1:{port}");
+    wait_ready(&base).await;
+
+    let hist: Value = reqwest::get(format!("{base}/stats/history"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let daily = hist["daily_history"].as_array().unwrap();
+    assert_eq!(daily.len(), 1, "expected one closed day, got {hist}");
+    assert_eq!(daily[0]["day"], 20200101);
+    assert_eq!(daily[0]["total_credits"], 8); // credits_total(8) - day_start(0)
+    assert!(hist["current_day"].as_u64().unwrap() > 20200101);
+}
+
+#[tokio::test]
 async fn e2e_persists_credits_across_restart() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

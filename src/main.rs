@@ -8,7 +8,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use ninehelius::config::Config;
 use ninehelius::state::{AppState, SharedState};
-use ninehelius::upstream::current_yyyymm;
+use ninehelius::upstream::{current_yyyymm, current_yyyymmdd};
 use ninehelius::{metrics, persistence, ratelimit, router};
 
 #[tokio::main]
@@ -62,16 +62,20 @@ fn spawn_snapshot_writer(state: SharedState) {
     });
 }
 
-/// Close out and reset per-key monthly counters at each UTC month boundary,
-/// recording the ended month into history.
+/// Close out and reset monthly + daily counters at each UTC boundary, recording
+/// the ended period into history.
 fn spawn_month_reset_ticker(state: SharedState) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
+        let retention = state.config.persistence.daily_retention_days;
         loop {
             tick.tick().await;
             state
                 .stats
                 .roll_month_if_changed(&state.pool, current_yyyymm());
+            state
+                .stats
+                .roll_day_if_changed(&state.pool, current_yyyymmdd(), retention);
         }
     });
 }
