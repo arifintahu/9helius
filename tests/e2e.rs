@@ -74,7 +74,7 @@ interval_secs = {interval_secs}
 }
 
 fn spawn_bin(cfg_path: &Path) -> ChildGuard {
-    let child = Command::new(env!("CARGO_BIN_EXE_ninehelius"))
+    let child = Command::new(env!("CARGO_BIN_EXE_9helius"))
         .env("NINEHELIUS_CONFIG", cfg_path)
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
@@ -398,7 +398,7 @@ async fn e2e_cli_config_and_state_flags() {
     .unwrap();
 
     // Spawn purely via CLI flags — no NINEHELIUS_CONFIG env.
-    let child = Command::new(env!("CARGO_BIN_EXE_ninehelius"))
+    let child = Command::new(env!("CARGO_BIN_EXE_9helius"))
         .arg("--config")
         .arg(&cfg_path)
         .arg("--state")

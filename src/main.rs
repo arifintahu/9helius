@@ -15,7 +15,7 @@ use ninehelius::{metrics, persistence, ratelimit, router};
 
 /// Transparent Helius RPC load balancer.
 #[derive(Parser, Debug)]
-#[command(name = "ninehelius", version, about, long_about = None)]
+#[command(name = "9helius", version, about, long_about = None)]
 struct Cli {
     /// Path to the config file.
     /// Overrides the NINEHELIUS_CONFIG env var; defaults to ./config.toml.

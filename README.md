@@ -96,8 +96,8 @@ curl -X POST "http://127.0.0.1:8080/?api-key=$GATEWAY_KEY" \
 The binary takes paths so it can run from anywhere (e.g. as a service):
 
 ```bash
-ninehelius --config /etc/9helius/config.toml --state /var/lib/9helius/credits.json
-ninehelius --help        # full usage; --version prints the build version
+9helius --config /etc/9helius/config.toml --state /var/lib/9helius/credits.json
+9helius --help        # full usage; --version prints the build version
 ```
 
 - `-c, --config <PATH>` — config file. Precedence: `--config` > `NINEHELIUS_CONFIG` env > `./config.toml`.
@@ -110,7 +110,7 @@ ninehelius --help        # full usage; --version prints the build version
 ```ini
 # /etc/systemd/system/9helius.service
 [Service]
-ExecStart=/usr/local/bin/ninehelius --config /etc/9helius/config.toml --state /var/lib/9helius/credits.json
+ExecStart=/usr/local/bin/9helius --config /etc/9helius/config.toml --state /var/lib/9helius/credits.json
 Restart=always
 # secrets via env instead of a file also work:
 # Environment=NINEHELIUS_UPSTREAMS__0__API_KEY=...

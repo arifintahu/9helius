@@ -9,8 +9,9 @@ Helius free-tier api-keys behind one gateway URL + api-key, forwarding requests
 to `mainnet.helius-rpc.com` in round-robin while tracking credits, respecting
 rate limits, and persisting all stats across restarts.
 
-- The cargo **package/binary is `ninehelius`** (cargo names can't start with a
-  digit); the repo/dir is `9helius`.
+- The cargo **package/lib crate is `ninehelius`** (cargo package names can't start
+  with a digit), but the **binary output is `9helius`** (set via `[[bin]] name`).
+  So code uses `use ninehelius::…` while the CLI is invoked as `9helius`.
 - Edition 2021, async on tokio, `axum` server + `reqwest` upstream client.
 
 ## Commands
@@ -77,7 +78,7 @@ build the router; `main.rs` is a small wrapper.
   selection, backoff, month/day rollover, snapshot restore.
 - **Integration** (`tests/proxy.rs`) — build the router in-process, drive via
   `tower`/reqwest against a `wiremock` Helius.
-- **E2E** (`tests/e2e.rs`) — spawn the real binary (`CARGO_BIN_EXE_ninehelius`)
+- **E2E** (`tests/e2e.rs`) — spawn the real binary (`CARGO_BIN_EXE_9helius`)
   against wiremock; covers failover, persistence/restart, history. A `ChildGuard`
   reaps the process on panic.
 

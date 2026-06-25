@@ -7,7 +7,7 @@ description = "Transparent Helius RPC load balancer — combines multiple free-t
 license = "MIT"
 
 [[bin]]
-name = "ninehelius"
+name = "9helius"
 path = "src/main.rs"
 
 [dependencies]
