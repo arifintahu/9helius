@@ -1,0 +1,44 @@
+[package]
+name = "ninehelius"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Transparent Helius RPC load balancer — combines multiple free-tier Helius keys behind one gateway URL"
+license = "MIT"
+
+[[bin]]
+name = "ninehelius"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["http2", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2", "gzip", "brotli"] }
+http = "1"
+bytes = "1"
+url = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+toml = "0.8"
+figment = { version = "0.10", features = ["toml", "env"] }
+
+governor = "0.6"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+thiserror = "1"
+anyhow = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+time = { version = "0.3", features = ["macros", "formatting"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

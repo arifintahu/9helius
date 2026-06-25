@@ -1,0 +1,62 @@
+# 9helius configuration — copy to config.toml and fill in real values.
+# config.toml is gitignored; never commit real api-keys.
+#
+# Any value can also be overridden via environment variables with the
+# NINEHELIUS_ prefix and __ as the nesting separator, e.g.:
+#   NINEHELIUS_GATEWAY__API_KEY=...           overrides gateway.api_key
+#   NINEHELIUS_UPSTREAMS__0__API_KEY=...       overrides the first upstream's key
+
+[gateway]
+# Address the proxy listens on.
+bind = "0.0.0.0:8080"
+# The single key clients must present as ?api-key=<this>. Generate a random one.
+api_key = "CHANGE_ME_gateway_token"
+# Where requests are forwarded. Only the api-key query param is rewritten.
+upstream_base = "https://mainnet.helius-rpc.com"
+# Per-request upstream timeout.
+request_timeout_ms = 15000
+# Max distinct upstream keys to try before giving up (one attempt per key).
+max_retries = 6
+# Reject request bodies larger than this (bytes) with HTTP 413.
+max_body_bytes = 5242880
+
+[persistence]
+# Credit-usage snapshot file (gitignored).
+path = "state/credits.snapshot.json"
+# How often to flush the snapshot to disk.
+interval_secs = 10
+# On unreadable/corrupt snapshot: "zero" (start fresh) or "cap" (assume keys full).
+on_snapshot_error = "zero"
+
+# Per-method credit cost overrides. Built-in defaults already cover the common
+# cases (standard = 1, getProgramAccounts = 10, DAS = 10, ZK = 10); list here
+# only to override or add methods.
+[costs.overrides]
+getProgramAccounts = 10
+getAsset = 10
+getAssetsByOwner = 10
+searchAssets = 10
+getValidityProofs = 100
+
+# Per-class requests-per-second limits (Helius free tier, per key).
+[rps]
+standard_rpc = 10
+send_transaction = 1
+get_program_accounts = 5
+das = 2
+zk = 2
+
+# The upstream Helius free-tier keys. Add one [[upstreams]] block per account.
+[[upstreams]]
+name = "helius-1"
+api_key = "00000000-0000-0000-0000-000000000001"
+credit_cap = 1000000
+enabled = true
+
+[[upstreams]]
+name = "helius-2"
+api_key = "00000000-0000-0000-0000-000000000002"
+credit_cap = 1000000
+enabled = true
+
+# ... add helius-3 through helius-6

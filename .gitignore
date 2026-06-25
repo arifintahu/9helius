@@ -1,0 +1,10 @@
+# Real secrets — never commit
+/config.toml
+
+# Runtime state (credit snapshots)
+/state/
+*.snapshot.json
+*.snapshot.json.tmp
+
+# Rust build artifacts
+/target
