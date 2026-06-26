@@ -6,6 +6,7 @@
 pub mod config;
 pub mod credits;
 pub mod error;
+pub mod keepalive;
 pub mod metrics;
 pub mod persistence;
 pub mod proxy;

@@ -11,7 +11,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use ninehelius::config::Config;
 use ninehelius::state::{AppState, SharedState};
 use ninehelius::upstream::{current_yyyymm, current_yyyymmdd};
-use ninehelius::{metrics, persistence, ratelimit, router};
+use ninehelius::{keepalive, metrics, persistence, ratelimit, router};
 
 /// Transparent Helius RPC load balancer.
 #[derive(Parser, Debug)]
@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     spawn_snapshot_writer(state.clone());
     spawn_month_reset_ticker(state.clone());
+    keepalive::spawn(state.clone());
 
     let app = router(state.clone());
 

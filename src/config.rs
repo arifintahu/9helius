@@ -39,6 +39,11 @@ pub struct GatewayConfig {
     pub max_retries: u32,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Ping each upstream key every N seconds (getHealth) to keep its Helius
+    /// connection warm and cut cold-connection tail latency. 0 disables.
+    /// Each ping costs ~1 credit per key, so a short interval spends credits.
+    #[serde(default = "default_keepalive_secs")]
+    pub keepalive_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -186,6 +191,9 @@ fn default_max_retries() -> u32 {
 }
 fn default_max_body_bytes() -> usize {
     5 * 1024 * 1024
+}
+fn default_keepalive_secs() -> u64 {
+    0
 }
 fn default_snapshot_path() -> PathBuf {
     PathBuf::from("state/credits.snapshot.json")

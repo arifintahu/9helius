@@ -19,6 +19,7 @@ pub mod names {
     pub const RPC_METHOD_TOTAL: &str = "ninehelius_rpc_method_total";
     pub const ALL_EXHAUSTED_TOTAL: &str = "ninehelius_all_exhausted_total";
     pub const REQUEST_DURATION_SECONDS: &str = "ninehelius_request_duration_seconds";
+    pub const KEEPALIVE_TOTAL: &str = "ninehelius_keepalive_total";
 }
 
 /// Install the global Prometheus recorder and return a handle for rendering.

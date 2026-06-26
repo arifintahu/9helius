@@ -19,6 +19,11 @@ request_timeout_ms = 15000
 max_retries = 6
 # Reject request bodies larger than this (bytes) with HTTP 413.
 max_body_bytes = 5242880
+# Keep each upstream connection warm by pinging it (getHealth) every N seconds,
+# cutting cold-connection tail latency. 0 disables (default).
+# COST: each ping is ~1 credit/key. At 30s that's ~86k credits/key/month (~8.6%
+# of a free key's 1M). Raise the interval to spend fewer credits; 60 ≈ 4.3%.
+keepalive_secs = 30
 
 [persistence]
 # Credit-usage snapshot file (gitignored). Relative paths resolve against the

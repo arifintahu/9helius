@@ -63,6 +63,9 @@ one has burned.
 - 🛡️ **Rate-limit handling** — proactive per-key/per-class token buckets, plus
   reactive failover: on HTTP `429` or JSON-RPC `-32005`, the key is put on an
   exponential-backoff cooldown and the request retries the next available key.
+- 🔥 **Warm connections** — an optional keep-alive pinger holds each key's Helius
+  connection open so round-robin never pays a cold TLS handshake (configurable;
+  off by default since each ping spends ~1 credit/key).
 - ♻️ **Fully durable** — every counter (per-key credits, lifetime totals,
   per-method tallies, global counters) is snapshotted atomically and restored on
   boot, then **replayed into Prometheus so `/metrics` resumes** instead of
@@ -177,6 +180,7 @@ bind = "0.0.0.0:8080"
 api_key = "your-secret-gateway-key"   # clients present this
 upstream_base = "https://mainnet.helius-rpc.com"
 max_retries = 6                        # distinct keys to try per request
+keepalive_secs = 0                     # ping each key every N s to stay warm (0 = off)
 
 [persistence]
 path = "state/credits.snapshot.json"
@@ -221,9 +225,42 @@ NINEHELIUS_UPSTREAMS__0__API_KEY=…
 | **Reset**      | At each UTC month boundary the ending month is archived to history and per-key *monthly* counters reset; *lifetime* counters never reset. |
 | **History**    | A per-month archive (unbounded — tiny) plus a per-day archive of credit usage, retained for `persistence.daily_retention_days` (default 90). Both are persisted and served at `/stats/history`. |
 
+## Benchmarks
+
+9helius (backed by Helius) vs the public [`solana-rpc.publicnode.com`](https://solana-rpc.publicnode.com),
+30 samples per method over a reused connection (3 warmups dropped), keep-alive
+enabled. Lower is better.
+
+| method | 9helius min / **p50** / avg (ms) | publicnode min / **p50** / avg (ms) |
+|--------|------------------------------|-----------------------------|
+| `getSlot` | 44 / **55** / 60 | 186 / **193** / 215 |
+| `getBalance` | 46 / **55** / 59 | 187 / **192** / 194 |
+| `getBlock` (header) | 40 / **50** / 53 | 187 / **196** / 220 |
+| `getBlockHeight` | 201 / **206** / 209 | 189 / **212** / 219 |
+| `getLatestBlockhash` | 192 / **202** / 207 | 189 / **198** / 202 |
+| `getEpochInfo` | 53 / **203** / 208 | 186 / **200** / 211 |
+
+- **~3–4× faster** on the common edge-cached reads (`getSlot`, `getBalance`,
+  `getBlock`): ~50 ms vs ~195 ms.
+- **Roughly tied** (~200 ms) on cluster-state reads (`getBlockHeight`,
+  `getLatestBlockhash`, `getEpochInfo`) — these bypass Helius's edge cache, so
+  there's no latency edge there (though min latency is often much lower).
+- The proxy itself adds only **~2–6 ms** over a direct Helius call.
+
+Absolute numbers are dominated by **your** network distance to each provider
+(publicnode's flat ~195 ms here is mostly RTT) — reproduce from your own host:
+
+```bash
+# with the gateway running locally:
+./scripts/benchmark.sh
+# or point it anywhere:
+GATEWAY="http://host:8080/?api-key=KEY" PUBLIC_RPC="https://..." N=30 ./scripts/benchmark.sh
+```
+
 ## Metrics
 
-All Prometheus metrics are prefixed `ninehelius_`:
+All Prometheus metrics are prefixed `ninehelius_` (plus `ninehelius_keepalive_total{upstream}`
+when the pinger is enabled):
 
 | Metric | Type | Labels |
 |--------|------|--------|

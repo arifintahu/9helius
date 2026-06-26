@@ -40,6 +40,7 @@ impl AppState {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.gateway.request_timeout_ms))
             .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(30))
             .build()?;
         let upstream_base = Url::parse(&config.gateway.upstream_base)?;
         let pool = Pool::from_config(&config.upstreams, &config.rps);
