@@ -12,7 +12,7 @@ failover, and per-key credit accounting.
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen.svg)](#testing)
-[![Status](https://img.shields.io/badge/status-v0.1-yellow.svg)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.1.1-yellow.svg)](#roadmap)
 
 </div>
 

@@ -1,6 +1,6 @@
 [package]
 name = "ninehelius"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Transparent Helius RPC load balancer — combines multiple free-tier Helius keys behind one gateway URL"
